@@ -186,3 +186,8 @@ trae_config.yaml
 
 # Patch selection python binary
 py312/
+
+# Large artifacts - not source
+evaluation/patch_selection/trae_selector/tools/py312.zip
+results/
+trae.pdf

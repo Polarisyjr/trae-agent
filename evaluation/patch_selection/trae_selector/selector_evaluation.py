@@ -96,15 +96,21 @@ def run_instance_by_group(
         sys.stderr = sys.__stderr__
         return
 
-    # check if the group is all failed or all success. If so, skip this group
+    # check if the group is all failed or all success. If so, skip this group.
+    # This short-circuit is an OFFLINE-EVALUATION optimisation: it relies on the
+    # ground-truth success_id (1=correct, 0=wrong). In LIVE selection the labels are
+    # unknown (success_id == -1), so we must NOT skip — always run the selector agent.
     all_failed = True
     all_success = True
+    has_known_labels = False
     for success_id in candidate_log["success_id"]:
+        if success_id in (0, 1):
+            has_known_labels = True
         if success_id == 1:
             all_failed = False
         if success_id != 1:
             all_success = False
-    if all_failed or all_success:
+    if has_known_labels and (all_failed or all_success):
         print(
             f"[Group ID {group_id} in {num_groups}] groups for instance {instance['instance_id']} {'all failed' if all_failed else 'all success'}. Skipping..."
         )
@@ -149,8 +155,13 @@ def run_instance_by_group(
     with open(log_file_path, "w") as log_file:
         sys.stdout = log_file
         sys.stderr = log_file
-        namespace = "swebench"
-        image_name = "sweb.eval.x86_64." + instance["instance_id"].replace("__", "_1776_")
+        # Image registry, honouring TRAE_SWEBENCH_REGISTRY (matches evaluation.utils).
+        if os.environ.get("TRAE_SWEBENCH_REGISTRY", "swebench").lower() == "epoch":
+            namespace = "ghcr.io/epoch-research"
+            image_name = "swe-bench.eval.x86_64." + instance["instance_id"]
+        else:
+            namespace = "swebench"
+            image_name = "sweb.eval.x86_64." + instance["instance_id"].replace("__", "_1776_")
         tag = "latest"
 
         try:

@@ -29,6 +29,24 @@ def docker_exec(container: Container, command: str):
     return return_code, output
 
 
+def swebench_instance_image(instance_id: str) -> str:
+    """Docker image reference for a SWE-bench instance, honouring TRAE_SWEBENCH_REGISTRY.
+
+    * "epoch"  -> Epoch AI's layer-optimized registry (~6x smaller on disk, ~30 GiB for
+      all 500 Verified images). Keeps `__` and is hosted on ghcr.io.
+    * default / "swebench" -> the official swebench Docker Hub images (~189 GiB for all
+      500), which map `__` -> `_1776_`.
+
+    Both layouts are harness-compatible (repo at /testbed, conda env "testbed").
+    """
+    import os
+
+    registry = os.environ.get("TRAE_SWEBENCH_REGISTRY", "swebench").lower()
+    if registry == "epoch":
+        return f"ghcr.io/epoch-research/swe-bench.eval.x86_64.{instance_id}:latest"
+    return f"swebench/sweb.eval.x86_64.{instance_id.lower()}:latest".replace("__", "_1776_")
+
+
 def swebench_evaluate_harness_after(benchmark_harness_path, task_id):
     src_base = f"{benchmark_harness_path}/logs/run_evaluation/{task_id}/trae-agent"
     dst_base = f"results/{task_id}"
@@ -185,9 +203,7 @@ BENCHMARK_CONFIG: dict[str, BenchmarkConfig] = {
         load_dataset=lambda dataset_name: load_dataset(
             f"princeton-nlp/{dataset_name}", split="test"
         ),
-        image_name=lambda instance_id: (
-            f"swebench/sweb.eval.x86_64.{instance_id.lower()}:latest".replace("__", "_1776_")
-        ),
+        image_name=lambda instance_id: swebench_instance_image(instance_id),
         problem_statement=lambda instance, instance_dir: (
             _write_problem_statement(instance_dir, instance.get("problem_statement", ""))
         ),

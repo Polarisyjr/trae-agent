@@ -1,0 +1,357 @@
+# Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
+# SPDX-License-Identifier: MIT
+
+"""Regression-testing (patch pruning) for SWE-bench candidate patches.
+
+This implements the *tester* of the Trae Agent paper's patch-pruning component
+(Section 3.3, "Perform regression testing"), faithfully (path A — no peeking at the
+gold FAIL_TO_PASS/PASS_TO_PASS labels by default):
+
+  1. Find passing tests: run the repo's test suite on the pristine codebase and keep
+     the tests that PASS. (No LLM.)
+  2. Select regression tests: ask the LLM to keep only the subset that a correct fix
+     should NOT change (a correct issue resolution may legitimately alter some
+     behaviour, so blindly requiring every old test to pass would discard good
+     patches). (LLM — via your trae_config.yaml model, e.g. vLLM.)
+  3. Validate each candidate: apply the patch, run the selected regression tests, and
+     record which fail. (No LLM.)
+
+Per Figure 2 (Patch Pruning = deduplication THEN regression testing), candidates are
+deduplicated (via the selector's `clean_patch` normalization) BEFORE step 3, so the
+expensive regression tests run once per unique patch and duplicates inherit their
+representative's result. (Note: trae's own selector applies these two filters in the
+reverse order, but on precomputed data, so it is functionally equivalent there.)
+
+It reuses:
+  * the SWE-bench instance Docker images + container plumbing of
+    `run_evaluation.BenchmarkEvaluation`;
+  * the `swebench` package for per-repo test commands (`MAP_REPO_VERSION_TO_SPECS`)
+    and per-repo log parsers (`MAP_REPO_TO_PARSER`) — the messy, repo-specific bits.
+
+Input/Output: it reads the candidate JSONL produced by
+`generate_candidates_swebench.py` and writes the SAME format back, but with the
+`regressions` field filled per patch:
+    regressions[i] == []            -> patch i passed all selected regression tests
+    regressions[i] == [test, ...]   -> patch i failed these (selector prunes it)
+
+SWE-bench only (the standard / most common setting). Run from the repo root:
+    uv run python -m evaluation.regression_test_swebench \
+        --dataset SWE-bench_Verified \
+        --candidates candidates.jsonl --output candidates_pruned.jsonl \
+        --config-file trae_config.yaml --model-name trae_agent_model --max_workers 4
+"""
+
+import argparse
+import io
+import json
+import re
+import tarfile
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from types import SimpleNamespace
+
+from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS, TestStatus
+from swebench.harness.log_parsers import MAP_REPO_TO_PARSER
+from tqdm import tqdm
+
+from trae_agent.utils.config import Config
+from trae_agent.utils.llm_clients.llm_basics import LLMMessage
+from trae_agent.utils.llm_clients.llm_client import LLMClient
+
+from .patch_selection.trae_selector.utils import clean_patch
+from .run_evaluation import BenchmarkEvaluation
+from .utils import docker_exec
+
+# Standard activation prefix for SWE-bench instance images (conda env "testbed",
+# repo checked out at /testbed). Overridable via --eval-prefix.
+DEFAULT_EVAL_PREFIX = "source /opt/miniconda3/bin/activate testbed && cd /testbed"
+
+SELECT_PROMPT = """You are selecting regression tests for a software issue.
+
+You are given a GitHub issue and a list of tests that currently PASS in the repository.
+Identify the subset of these tests that should STILL pass after a correct fix for the
+issue — i.e. tests whose behaviour a correct resolution is NOT expected to change.
+Exclude tests that the fix may legitimately alter (e.g. tests asserting the very buggy
+behaviour described in the issue).
+
+Return ONLY a JSON array of test names, each chosen verbatim from the provided list.
+
+## Issue
+{issue}
+
+## Passing tests (choose from these only)
+{tests}
+"""
+
+
+class RegressionTester(BenchmarkEvaluation):
+    """Fill the `regressions` field of candidate patches via regression testing."""
+
+    def __init__(self, *args, model_name: str, eval_prefix: str, universe: str,
+                 max_tests_for_llm: int, test_timeout: int = 300, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.eval_prefix = eval_prefix
+        self.universe = universe
+        self.max_tests_for_llm = max_tests_for_llm
+        self.test_timeout = test_timeout
+
+        config = Config.create(config_file=self.trae_config_file_name)
+        if not config.models or model_name not in config.models:
+            raise ValueError(f"Model {model_name} not found in {self.trae_config_file_name}")
+        self.model_config = config.models[model_name]
+        self.model_config.resolve_config_values()
+        self.llm_client = LLMClient(self.model_config)
+
+    # --- container helpers ---------------------------------------------------
+
+    def _start_container(self, instance_id: str):
+        return self.docker_client.containers.run(
+            self._image_name(instance_id),
+            command="/bin/bash",
+            detach=True, tty=True, stdin_open=True,
+        )
+
+    def _bash(self, container, command: str):
+        return docker_exec(container, f"/bin/bash -c '{command}'")
+
+    def _reset_repo(self, container):
+        self._bash(container, "cd /testbed && git checkout -- . && git clean -fdq")
+
+    def _apply_patch(self, container, patch_text: str) -> bool:
+        # Copy the patch into the container, then try git apply with patch(1) fallback.
+        tar_stream = io.BytesIO()
+        with tarfile.open(fileobj=tar_stream, mode="w") as tar:
+            data = patch_text.encode()
+            info = tarfile.TarInfo(name="candidate.patch")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        tar_stream.seek(0)
+        container.put_archive("/tmp", tar_stream.getvalue())
+        rc, _ = self._bash(
+            container,
+            "cd /testbed && (git apply -v /tmp/candidate.patch || "
+            "patch --batch --fuzz=5 -p1 -i /tmp/candidate.patch)",
+        )
+        return rc == 0
+
+    def _run_tests(self, container, test_cmd: str, test_ids: list[str] | None) -> str:
+        ids = (" " + " ".join(test_ids)) if test_ids else ""
+        # Wrap in `timeout` so a hanging test (e.g. requests network tests with no
+        # connectivity) can't block the whole stage indefinitely. On timeout the run is
+        # killed; tests with no PASSED line are then treated as failed (conservative).
+        cmd = f"{self.eval_prefix} && timeout {self.test_timeout} {test_cmd}{ids}"
+        _, out = self._bash(container, cmd)
+        return out
+
+    def _parse(self, repo: str, version: str, instance_id: str, log: str) -> dict[str, str]:
+        parser = MAP_REPO_TO_PARSER[repo]
+        stub = SimpleNamespace(repo=repo, version=version, instance_id=instance_id)
+        try:
+            return parser(log, stub)
+        except Exception:
+            return {}
+
+    # --- pipeline steps ------------------------------------------------------
+
+    def _test_cmd(self, repo: str, version: str) -> str:
+        return MAP_REPO_VERSION_TO_SPECS[repo][version]["test_cmd"]
+
+    def find_passing_tests(self, container, repo, version, instance_id, instance) -> list[str]:
+        """Step 1: tests that pass in the pristine repo."""
+        if self.universe == "pass_to_pass":
+            # Fast (less fair): trust SWE-bench's curated pass-to-pass set as the universe.
+            return json.loads(instance.get("PASS_TO_PASS", "[]"))
+        # Faithful: run the whole suite (bare test_cmd runs everything) and keep passers.
+        self._reset_repo(container)
+        log = self._run_tests(container, self._test_cmd(repo, version), None)
+        status = self._parse(repo, version, instance_id, log)
+        return [t for t, s in status.items() if s == TestStatus.PASSED.value]
+
+    def select_regression_tests(self, issue: str, passing: list[str]) -> list[str]:
+        """Step 2: LLM keeps the subset that a correct fix should not change."""
+        if not passing:
+            return []
+        shown = passing
+        if len(shown) > self.max_tests_for_llm:
+            print(f"[regr] {len(shown)} passing tests > cap {self.max_tests_for_llm}; truncating "
+                  f"for the LLM prompt (rest are dropped from the regression set)")
+            shown = shown[: self.max_tests_for_llm]
+        prompt = SELECT_PROMPT.format(issue=issue, tests="\n".join(shown))
+        resp = self.llm_client.chat(
+            [LLMMessage(role="user", content=prompt)], self.model_config, None, reuse_history=False
+        )
+        selected = self._extract_json_list(resp.content)
+        passing_set = set(shown)
+        # Keep only valid picks; if the LLM returns nothing usable, fall back to all shown.
+        chosen = [t for t in selected if t in passing_set]
+        return chosen or shown
+
+    @staticmethod
+    def _extract_json_list(text: str) -> list[str]:
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+            return [str(x) for x in data] if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            return []
+
+    def validate_candidate(self, container, repo, version, instance_id, regression_tests,
+                           patch_text) -> list[str]:
+        """Step 3: failed regression tests for one candidate patch."""
+        if not regression_tests:
+            return []
+        self._reset_repo(container)
+        if not self._apply_patch(container, patch_text):
+            # Unappliable patch -> treat as failing everything (will be pruned).
+            return list(regression_tests)
+        log = self._run_tests(container, self._test_cmd(repo, version), regression_tests)
+        status = self._parse(repo, version, instance_id, log)
+        failed = []
+        for t in regression_tests:
+            # A regression test must PASS; anything else (fail/error/missing) is a failure.
+            if status.get(t) != TestStatus.PASSED.value:
+                failed.append(t)
+        return failed
+
+    def process_instance(self, entry: dict) -> dict:
+        instance_id = entry["instance_id"]
+        instance = next((i for i in self.dataset if i["instance_id"] == instance_id), None)
+        if instance is None:
+            print(f"[regr] {instance_id}: not in dataset, skipping")
+            return entry
+        repo, version = instance["repo"], instance["version"]
+        if repo not in MAP_REPO_VERSION_TO_SPECS or repo not in MAP_REPO_TO_PARSER:
+            print(f"[regr] {instance_id}: repo {repo} unsupported by swebench, skipping")
+            return entry
+
+        container = self._start_container(instance_id)
+        try:
+            passing = self.find_passing_tests(container, repo, version, instance_id, instance)
+            regression = self.select_regression_tests(entry.get("issue", ""), passing)
+
+            # Figure 2 order: deduplicate BEFORE regression testing, so the expensive
+            # tests run once per unique patch (duplicates share their representative's
+            # result). Uses the same clean_patch normalization as the selector.
+            patches = entry["patches"]
+            keys = []
+            for i, p in enumerate(patches):
+                try:
+                    keys.append(clean_patch(p))
+                except Exception:
+                    keys.append(f"__unparsable_{i}__")  # treat as its own class
+            rep_of: dict[str, int] = {}
+            for i, k in enumerate(keys):
+                rep_of.setdefault(k, i)
+            unique_reps = sorted(set(rep_of.values()))
+            print(f"[regr] {instance_id}: {len(passing)} passing -> {len(regression)} regression "
+                  f"tests; {len(patches)} candidates -> {len(unique_reps)} unique (dedup first)")
+
+            rep_failed = {}
+            for i in unique_reps:
+                failed = self.validate_candidate(
+                    container, repo, version, instance_id, regression, patches[i]
+                )
+                rep_failed[i] = failed
+                print(f"[regr]   {instance_id} cand {i}: "
+                      f"{'PASS' if not failed else f'{len(failed)} failed'}")
+
+            # Propagate each representative's result to its duplicates.
+            entry["regressions"] = [rep_failed[rep_of[keys[i]]] for i in range(len(patches))]
+            entry["regression_done"] = True
+        finally:
+            container.stop()
+            container.remove()
+        return entry
+
+    def run(self, candidates_path: str, output_path: str, max_workers: int):
+        with open(candidates_path) as f:
+            entries = [json.loads(line) for line in f if line.strip()]
+
+        # Resume: skip entries already processed in the output file.
+        done = set()
+        try:
+            with open(output_path) as f:
+                for line in f:
+                    if line.strip():
+                        rec = json.loads(line)
+                        if rec.get("regression_done"):
+                            done.add(rec["instance_id"])
+        except FileNotFoundError:
+            pass
+        todo = [e for e in entries if e["instance_id"] not in done]
+        if done:
+            print(f"Resuming: {len(done)} done, {len(todo)} to do.")
+
+        write_lock = threading.Lock()
+
+        def _work(entry):
+            try:
+                result = self.process_instance(entry)
+            except Exception:
+                print(f"[regr] {entry['instance_id']} failed:\n{traceback.format_exc()}")
+                result = entry
+            with write_lock, open(output_path, "a") as f:
+                f.write(json.dumps(result) + "\n")
+            return entry["instance_id"]
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_work, e): e["instance_id"] for e in todo}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Regression testing"):
+                fut.result()
+        print(f"Done. Pruned candidates written to {output_path}")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--dataset", default="SWE-bench_Verified",
+                   help="SWE-bench dataset name (default: SWE-bench_Verified).")
+    p.add_argument("--candidates", required=True, help="Input candidate JSONL (from generation).")
+    p.add_argument("--output", required=True, help="Output JSONL with `regressions` filled.")
+    p.add_argument("--config-file", default="trae_config.yaml",
+                   help="trae config (for the LLM selector model; e.g. vLLM).")
+    p.add_argument("--model-name", default="trae_agent_model",
+                   help="Model key in the config used for regression-test selection.")
+    p.add_argument("--working-dir", default="./trae-workspace", help="Host workspace dir.")
+    p.add_argument("--universe", choices=["suite", "pass_to_pass"], default="suite",
+                   help="Source of the passing-test universe. 'suite' (default, faithful) runs "
+                        "the whole suite; 'pass_to_pass' trusts SWE-bench's curated set (faster, "
+                        "less fair — leaks the gold test universe).")
+    p.add_argument("--max-tests-for-llm", type=int, default=300,
+                   help="Cap on passing tests shown to the LLM selector.")
+    p.add_argument("--eval-prefix", default=DEFAULT_EVAL_PREFIX,
+                   help="Shell prefix to activate the test env inside the image.")
+    p.add_argument("--test-timeout", type=int, default=300,
+                   help="Per test-run timeout (seconds) inside the container, so a hanging "
+                        "test cannot block the stage.")
+    p.add_argument("--max_workers", type=int, default=4, help="Parallel workers across instances.")
+    args = p.parse_args()
+
+    # Only touch (and pull images for) the instances present in the candidate file.
+    with open(args.candidates) as f:
+        candidate_ids = [json.loads(line)["instance_id"] for line in f if line.strip()]
+
+    tester = RegressionTester(
+        "SWE-bench",
+        args.working_dir,
+        args.config_file,
+        args.dataset,
+        "",   # docker_env_config
+        "",   # benchmark_harness_path (unused)
+        "trae-agent-regr",
+        args.max_workers,
+        candidate_ids,
+        model_name=args.model_name,
+        eval_prefix=args.eval_prefix,
+        universe=args.universe,
+        max_tests_for_llm=args.max_tests_for_llm,
+        test_timeout=args.test_timeout,
+    )
+    tester.run(args.candidates, args.output, args.max_workers)
+
+
+if __name__ == "__main__":
+    main()

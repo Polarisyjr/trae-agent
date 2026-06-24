@@ -175,7 +175,10 @@ class BenchmarkEvaluation:
             "curl -LsSf https://astral.sh/uv/install.sh | sh",
             "rm -rf /trae-workspace/trae-agent && mkdir /trae-workspace/trae-agent",
             "cp -r -t /trae-workspace/trae-agent/ /trae-src/trae_agent /trae-src/.python-version /trae-src/pyproject.toml /trae-src/uv.lock /trae-src/README.md",
-            "cd /trae-workspace/trae-agent && source $HOME/.local/bin/env && uv sync",
+            # `docker` and `pexpect` are imported unconditionally by
+            # trae_agent.agent.docker_manager but live in the evaluation extra, so a bare
+            # `uv sync` produces a venv where `trae-cli` cannot even import. Add them.
+            "cd /trae-workspace/trae-agent && source $HOME/.local/bin/env && uv sync && uv pip install docker pexpect",
         ]
 
         for command in tqdm(
