@@ -44,11 +44,13 @@ SWE-bench only (the standard / most common setting). Run from the repo root:
 import argparse
 import io
 import json
+import os
 import re
 import tarfile
 import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from types import SimpleNamespace
 
 from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS, TestStatus
@@ -58,10 +60,10 @@ from tqdm import tqdm
 from trae_agent.utils.config import Config
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage
 from trae_agent.utils.llm_clients.llm_client import LLMClient
+from trae_agent.utils.trajectory_recorder import TrajectoryRecorder
 
 from .patch_selection.trae_selector.utils import clean_patch
 from .run_evaluation import BenchmarkEvaluation
-from .utils import docker_exec
 
 # Standard activation prefix for SWE-bench instance images (conda env "testbed",
 # repo checked out at /testbed). Overridable via --eval-prefix.
@@ -89,12 +91,16 @@ class RegressionTester(BenchmarkEvaluation):
     """Fill the `regressions` field of candidate patches via regression testing."""
 
     def __init__(self, *args, model_name: str, eval_prefix: str, universe: str,
-                 max_tests_for_llm: int, test_timeout: int = 300, **kwargs):
+                 max_tests_for_llm: int, test_timeout: int = 300,
+                 trajectory_dir: str | None = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.eval_prefix = eval_prefix
         self.universe = universe
         self.max_tests_for_llm = max_tests_for_llm
         self.test_timeout = test_timeout
+        # Per-instance trajectory files, so the regression LLM call lands in the same
+        # `llm_interactions[]` turn format as the generate/selector stages (normalized).
+        self.trajectory_dir = trajectory_dir
 
         config = Config.create(config_file=self.trae_config_file_name)
         if not config.models or model_name not in config.models:
@@ -113,7 +119,12 @@ class RegressionTester(BenchmarkEvaluation):
         )
 
     def _bash(self, container, command: str):
-        return docker_exec(container, f"/bin/bash -c '{command}'")
+        # Pass argv as a LIST so docker-py sends it as-is instead of shlex-splitting a
+        # `bash -c '<command>'` STRING. The regression command embeds the full test_cmd
+        # plus up to 300 test ids; quotes/apostrophes inside it break the single-quote
+        # wrap (shlex raises "No closing quotation"). A list sidesteps the split entirely.
+        rc, out = container.exec_run(cmd=["/bin/bash", "-c", command])
+        return rc, out.decode("utf-8")
 
     def _reset_repo(self, container):
         self._bash(container, "cd /testbed && git checkout -- . && git clean -fdq")
@@ -168,7 +179,8 @@ class RegressionTester(BenchmarkEvaluation):
         status = self._parse(repo, version, instance_id, log)
         return [t for t, s in status.items() if s == TestStatus.PASSED.value]
 
-    def select_regression_tests(self, issue: str, passing: list[str]) -> list[str]:
+    def select_regression_tests(self, issue: str, passing: list[str],
+                                instance_id: str = "") -> list[str]:
         """Step 2: LLM keeps the subset that a correct fix should not change."""
         if not passing:
             return []
@@ -178,14 +190,39 @@ class RegressionTester(BenchmarkEvaluation):
                   f"for the LLM prompt (rest are dropped from the regression set)")
             shown = shown[: self.max_tests_for_llm]
         prompt = SELECT_PROMPT.format(issue=issue, tests="\n".join(shown))
-        resp = self.llm_client.chat(
-            [LLMMessage(role="user", content=prompt)], self.model_config, None, reuse_history=False
-        )
+        messages = [LLMMessage(role="user", content=prompt)]
+        resp = self.llm_client.chat(messages, self.model_config, None, reuse_history=False)
+        self._record_turn(instance_id, messages, resp)
         selected = self._extract_json_list(resp.content)
         passing_set = set(shown)
         # Keep only valid picks; if the LLM returns nothing usable, fall back to all shown.
         chosen = [t for t in selected if t in passing_set]
         return chosen or shown
+
+    def _record_turn(self, instance_id: str, messages, response) -> None:
+        """Record the single regression LLM call as one turn in `llm_interactions[]`,
+        matching the generate/selector trajectory format. One file per instance.
+
+        A fresh recorder per call keeps this thread-safe across the instance-level
+        ThreadPoolExecutor (the shared self.llm_client has no recorder attached)."""
+        if not self.trajectory_dir:
+            return
+        try:
+            provider = self.model_config.model_provider.provider
+            path = Path(self.trajectory_dir) / f"{instance_id or 'unknown'}.json"
+            recorder = TrajectoryRecorder(str(path))
+            recorder.start_recording(
+                task=f"regression test selection: {instance_id}",
+                provider=provider,
+                model=self.model_config.model,
+                max_steps=1,
+            )
+            recorder.record_llm_interaction(
+                messages, response, provider, self.model_config.model, None
+            )
+            recorder.finalize_recording(True, response.content)
+        except Exception as e:
+            print(f"[regr] {instance_id}: failed to record trajectory: {e}")
 
     @staticmethod
     def _extract_json_list(text: str) -> list[str]:
@@ -230,7 +267,7 @@ class RegressionTester(BenchmarkEvaluation):
         container = self._start_container(instance_id)
         try:
             passing = self.find_passing_tests(container, repo, version, instance_id, instance)
-            regression = self.select_regression_tests(entry.get("issue", ""), passing)
+            regression = self.select_regression_tests(entry.get("issue", ""), passing, instance_id)
 
             # Figure 2 order: deduplicate BEFORE regression testing, so the expensive
             # tests run once per unique patch (duplicates share their representative's
@@ -327,8 +364,19 @@ def main():
     p.add_argument("--test-timeout", type=int, default=300,
                    help="Per test-run timeout (seconds) inside the container, so a hanging "
                         "test cannot block the stage.")
+    p.add_argument("--trajectory-dir", default=None,
+                   help="Dir for per-instance trajectory files recording the regression "
+                        "LLM call as a turn (normalized with generate/selector). Defaults to "
+                        "<output_dir>/regression_trajectories; pass '' to disable.")
     p.add_argument("--max_workers", type=int, default=4, help="Parallel workers across instances.")
     args = p.parse_args()
+
+    # Default: write trajectories next to the pruned output so the turn counter finds
+    # them alongside the generate/selector turns. Pass --trajectory-dir '' to disable.
+    if args.trajectory_dir is None:
+        args.trajectory_dir = os.path.join(
+            os.path.dirname(os.path.abspath(args.output)), "regression_trajectories"
+        )
 
     # Only touch (and pull images for) the instances present in the candidate file.
     with open(args.candidates) as f:
@@ -349,6 +397,7 @@ def main():
         universe=args.universe,
         max_tests_for_llm=args.max_tests_for_llm,
         test_timeout=args.test_timeout,
+        trajectory_dir=args.trajectory_dir,
     )
     tester.run(args.candidates, args.output, args.max_workers)
 
