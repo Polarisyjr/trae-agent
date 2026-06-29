@@ -67,7 +67,9 @@ class Sandbox:
                     self.sandbox.shell.before = b""
                     self.sandbox.shell.after = b""
                     self.sandbox.shell.buffer = b""
-                    time.sleep(2)
+                    # expect() already blocks until the prompt returns (the appended
+                    # `&& sleep 0.5` flushes output first), so the fixed time.sleep(2)
+                    # here was pure dead time — ~2s wasted per selector tool call.
                     self.sandbox.shell.expect([r"swe-bench@.*:.*\$ ", r"root@.*:.*# "], 60)
                     try:
                         output = (
@@ -117,7 +119,9 @@ class Sandbox:
             if self.shell and self.shell.isalive():
                 self.shell.close(force=True)
                 self.shell = None
-            self.container.stop()
-            self.container.remove()
+            # SIGKILL + remove in one; skip docker stop's 10s SIGTERM grace (the
+            # sandbox's PID 1 ignores SIGTERM). A fresh sandbox is created per
+            # group/retry, so this 10s saving compounds across the select stage.
+            self.container.remove(force=True)
             print(f"Container {self.container.short_id} stopped and removed")
             self.container = None

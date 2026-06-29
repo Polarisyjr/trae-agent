@@ -42,6 +42,25 @@ from .run_evaluation import BenchmarkEvaluation
 from .utils import docker_exec
 
 
+def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) -> None:
+    """Append a container-setup timing record (epoch wall) to $STEP3_CONTAINER_LOG
+    so step3's timeline can show docker container startup as its own lane (generate
+    builds + injects trae-agent into the instance container ONCE here, then reuses it
+    across all N candidate runs). No-op when the env var is unset."""
+    import os
+    path = os.environ.get("STEP3_CONTAINER_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
+                                "wall_s": round(t1 - t0, 3), "stage": stage,
+                                "instance_id": instance_id,
+                                "kind": "container_setup"}) + "\n")
+    except OSError:
+        pass
+
+
 class CandidateGeneration(BenchmarkEvaluation):
     """Generate N candidate patches per instance, serially, inside one container."""
 
@@ -61,7 +80,10 @@ class CandidateGeneration(BenchmarkEvaluation):
             return None
 
         repo_dir = self.config.working_dir(instance_id)  # e.g. "/testbed/" for SWE-bench
+        import time as _time
+        _c0 = _time.time()
         container = self.prepare_experiment_container(instance)
+        _record_container_setup("generate", instance_id, _c0, _time.time())
 
         patches: list[str] = []
         attempt = 0
@@ -75,9 +97,17 @@ class CandidateGeneration(BenchmarkEvaluation):
                 patch_file = f"/instance-data/{instance_id}_cand{attempt}.patch"
                 traj_file = f"/instance-data/{instance_id}_cand{attempt}.json"
                 base_url_opt = f" --model-base-url {base_url}" if base_url else ""
+                # Invoke trae-cli via the venv's console script DIRECTLY (shebang ->
+                # venv python) instead of `source .venv/bin/activate && trae-cli`.
+                # Activation prepends .venv/bin to PATH, which the agent's bash tool
+                # then inherits, so the agent's `python3` resolves to trae's venv
+                # (Python 3.12, no repo deps) instead of the container's testbed conda
+                # python (which HAS mpmath etc.) -> `import sympy` failed mid-run.
+                # Calling the script directly keeps trae-cli on its own python while
+                # leaving the agent's PATH = container default (testbed python).
                 command = (
-                    f"source trae-agent/.venv/bin/activate && "
-                    f"trae-cli run --file /instance-data/problem_statement.txt "
+                    f"trae-agent/.venv/bin/trae-cli run "
+                    f"--file /instance-data/problem_statement.txt "
                     f'--working-dir="{repo_dir}" '
                     f"--config-file trae_config.yaml --must-patch "
                     f"--patch-path {patch_file} --trajectory-file {traj_file} "
@@ -104,8 +134,10 @@ class CandidateGeneration(BenchmarkEvaluation):
                 else:
                     print(f"[{instance_id}] attempt {attempt}: empty patch")
         finally:
-            container.stop()
-            container.remove()
+            # SIGKILL + remove in one; skip docker stop's 10s SIGTERM grace (the
+            # container's PID 1 ignores SIGTERM, so stop() always waits the full
+            # default timeout). Saves ~10s of dead time at this stage's teardown.
+            container.remove(force=True)
 
         if len(patches) < num_candidate:
             print(f"[{instance_id}] WARNING: only {len(patches)}/{num_candidate} after "

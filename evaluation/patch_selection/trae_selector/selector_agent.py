@@ -66,11 +66,16 @@ def parse_tool_response(answer: LLMResponse, finish_reason: str, sandbox_session
             tool_call_id = tool_call.call_id
             tool_name = tool_call.name
 
+            # Use the image's real python (/opt/miniconda3/bin/python3, 3.11). The
+            # hardcoded /home/swe-bench/py312/bin/python3 never exists (sandbox.py only
+            # copies the tools dir into /home/swe-bench/, never a py312), so every tool
+            # call died with "No such file or directory" -> no "Tool Call Status:" line
+            # -> the success check mis-read it as success. A real python fixes both.
             if tool_name == "str_replace_based_edit_tool":
-                cmd = "cd /home/swe-bench/tools/ && /home/swe-bench/py312/bin/python3 execute_str_replace_editor.py"
+                cmd = "cd /home/swe-bench/tools/ && /opt/miniconda3/bin/python3 execute_str_replace_editor.py"
             elif tool_name == "bash":
                 cmd = (
-                    "cd /home/swe-bench/tools/ && /home/swe-bench/py312/bin/python3 execute_bash.py"
+                    "cd /home/swe-bench/tools/ && /opt/miniconda3/bin/python3 execute_bash.py"
                 )
             else:
                 tool_message = LLMMessage(
@@ -191,14 +196,26 @@ class SelectorAgent:
         print(f"max_turn: {self.max_turn}")
         print(f"### User Prompt:\n{self.initial_messages[1].content}\n")
 
+        # Mirror the generator (base_agent): stamp a start_time so step3's tool lane has
+        # a t_0 for the first bar, and so agent_steps[] (recorded below) is populated.
+        self.trajectory_recorder.start_recording(
+            task=self.issue_description,
+            provider=self.llm_config.model_provider.provider,
+            model=self.llm_config.model,
+            max_steps=self.max_turn,
+        )
+
         turn = 0
         final_id, final_patch = self.candidate_list[0].id, self.candidate_list[0].patch
         messages = self.initial_messages
         while turn < self.max_turn:
             turn += 1
-            llm_response = self.llm_client.chat(messages, self.llm_config, self.tools)
+            input_messages = messages
+            llm_response = self.llm_client.chat(input_messages, self.llm_config, self.tools)
+            # Keep recording the raw interaction (LLM-response time) -> llm_interactions[],
+            # which count_turns.py reads for per-stage turn/token totals.
             self.trajectory_recorder.record_llm_interaction(
-                messages,
+                input_messages,
                 llm_response,
                 self.llm_config.model_provider.provider,
                 self.llm_config.model,
@@ -213,6 +230,15 @@ class SelectorAgent:
             )
 
             if match:
+                # Final-answer turn: no tool ran. Record an agent_step at step end (like
+                # the generator's task_done step) so the trajectory ends cleanly on the
+                # agent_steps[] timeline that step3 harvests.
+                self.trajectory_recorder.record_agent_step(
+                    step_number=turn,
+                    state="completed",
+                    llm_messages=input_messages,
+                    llm_response=llm_response,
+                )
                 print("Match-1:", match.group(1).strip())
                 match = re.search(
                     r"(?:###\s*)?Result:\s*(.+?)\s*(?:###\s*)?Analysis:", answer_content
@@ -231,7 +257,21 @@ class SelectorAgent:
                 messages += parse_tool_response(
                     llm_response, llm_response.finish_reason or "", self.sandbox_session
                 )
-                if messages[-1].content and " seconds. Partial output:" in messages[-1].content:
+                # Record at STEP END (after the tool ran in the sandbox), carrying the
+                # executed tool_calls + their results. This writes agent_steps[] exactly
+                # like the generator's record_agent_step, so step3's tool lane harvests
+                # select via its primary (agent_steps) branch -- step-end timestamp (no
+                # off-by-one) and a known success, with no select-specific timeline code.
+                tool_results = [m.tool_result for m in messages if m.tool_result is not None]
+                self.trajectory_recorder.record_agent_step(
+                    step_number=turn,
+                    state="running",
+                    llm_messages=input_messages,
+                    llm_response=llm_response,
+                    tool_calls=llm_response.tool_calls,
+                    tool_results=tool_results,
+                )
+                if messages and messages[-1].content and " seconds. Partial output:" in messages[-1].content:
                     self.sandbox_session = self.sandbox.get_session()
 
             print(f"\n### System Response({turn})\n", messages)

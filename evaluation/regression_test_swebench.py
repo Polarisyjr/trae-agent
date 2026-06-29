@@ -69,6 +69,24 @@ from .run_evaluation import BenchmarkEvaluation
 # repo checked out at /testbed). Overridable via --eval-prefix.
 DEFAULT_EVAL_PREFIX = "source /opt/miniconda3/bin/activate testbed && cd /testbed"
 
+
+def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) -> None:
+    """Append a container-setup timing record (epoch wall) to $STEP3_CONTAINER_LOG
+    so step3's timeline can show docker container startup as its own lane. No-op
+    when the env var is unset (normal non-profiled runs)."""
+    import os
+    path = os.environ.get("STEP3_CONTAINER_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
+                                "wall_s": round(t1 - t0, 3), "stage": stage,
+                                "instance_id": instance_id,
+                                "kind": "container_setup"}) + "\n")
+    except OSError:
+        pass
+
 SELECT_PROMPT = """You are selecting regression tests for a software issue.
 
 You are given a GitHub issue and a list of tests that currently PASS in the repository.
@@ -146,14 +164,76 @@ class RegressionTester(BenchmarkEvaluation):
         )
         return rc == 0
 
-    def _run_tests(self, container, test_cmd: str, test_ids: list[str] | None) -> str:
+    def _container_cpu_usec(self, container) -> int | None:
+        """Total CPU-microseconds burned by every process in the container, from its
+        cgroup. Host-side, no docker call. exec_run wall-clock can't attribute this
+        (the work runs in the container's cgroup, not this host process). Handles both
+        cgroup v2 (cpu.stat usage_usec, µs) and v1 (cpuacct.usage, ns)."""
+        import glob
+        cid = container.id
+        # cgroup v2: cpu.stat usage_usec (microseconds)
+        v2 = [f"/sys/fs/cgroup/system.slice/docker-{cid}.scope/cpu.stat"]
+        v2 += glob.glob(f"/sys/fs/cgroup/**/docker-{cid}.scope/cpu.stat", recursive=True)
+        for path in v2:
+            try:
+                for line in open(path):
+                    if line.startswith("usage_usec"):
+                        return int(line.split()[1])
+            except OSError:
+                continue
+        # cgroup v1: cpuacct.usage (nanoseconds) -> microseconds
+        v1 = [f"/sys/fs/cgroup/cpu,cpuacct/docker/{cid}/cpuacct.usage",
+              f"/sys/fs/cgroup/cpuacct/docker/{cid}/cpuacct.usage"]
+        v1 += glob.glob(f"/sys/fs/cgroup/cpu,cpuacct/**/docker-{cid}.scope/cpuacct.usage",
+                        recursive=True)
+        v1 += glob.glob(f"/sys/fs/cgroup/cpu,cpuacct/**/{cid}/cpuacct.usage", recursive=True)
+        for path in v1:
+            try:
+                return int(open(path).read().strip()) // 1000
+            except (OSError, ValueError):
+                continue
+        return None
+
+    def _run_tests(self, container, test_cmd: str, test_ids: list[str] | None,
+                   instance_id: str = "", phase: str = "test") -> str:
         ids = (" " + " ".join(test_ids)) if test_ids else ""
         # Wrap in `timeout` so a hanging test (e.g. requests network tests with no
         # connectivity) can't block the whole stage indefinitely. On timeout the run is
         # killed; tests with no PASSED line are then treated as failed (conservative).
-        cmd = f"{self.eval_prefix} && timeout {self.test_timeout} {test_cmd}{ids}"
+        # `env` so a test_cmd with a leading VAR=val (e.g. sympy's
+        # "PYTHONWARNINGS='...' bin/test") works: without it `timeout` treats the
+        # assignment as the program name and dies with rc 127 in <1s (0 passing).
+        cmd = f"{self.eval_prefix} && timeout {self.test_timeout} env {test_cmd}{ids}"
+        # Measure the test-suite run: wall-clock + container CPU-seconds (cgroup delta
+        # around the exec). Excludes container startup (already running) and the
+        # reset/apply done in separate exec calls — just this test run + its eval_prefix.
+        import time
+        t0 = time.time()
+        c0 = self._container_cpu_usec(container)
         _, out = self._bash(container, cmd)
+        t1 = time.time()
+        c1 = self._container_cpu_usec(container)
+        self._record_test_run(instance_id, phase, t0, t1, c0, c1, test_ids)
         return out
+
+    def _record_test_run(self, instance_id, phase, t0, t1, c0, c1, test_ids) -> None:
+        """Append one test-run timing record (epoch ts + wall + container CPU-seconds)
+        to <trajectory_dir>/<instance_id>_test_runs.jsonl, on the SAME clock as step3."""
+        if not self.trajectory_dir:
+            return
+        cpu_s = (c1 - c0) / 1e6 if (c0 is not None and c1 is not None) else None
+        rec = {"ts_start": round(t0, 3), "ts_end": round(t1, 3),
+               "wall_s": round(t1 - t0, 3),
+               "cpu_s": round(cpu_s, 3) if cpu_s is not None else None,
+               "phase": phase, "instance_id": instance_id,
+               "n_tests": len(test_ids) if test_ids else None}
+        try:
+            os.makedirs(self.trajectory_dir, exist_ok=True)
+            path = os.path.join(self.trajectory_dir, f"{instance_id}_test_runs.jsonl")
+            with open(path, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            print(f"[regr] {instance_id}: failed to record test run: {e}")
 
     def _parse(self, repo: str, version: str, instance_id: str, log: str) -> dict[str, str]:
         parser = MAP_REPO_TO_PARSER[repo]
@@ -175,7 +255,8 @@ class RegressionTester(BenchmarkEvaluation):
             return json.loads(instance.get("PASS_TO_PASS", "[]"))
         # Faithful: run the whole suite (bare test_cmd runs everything) and keep passers.
         self._reset_repo(container)
-        log = self._run_tests(container, self._test_cmd(repo, version), None)
+        log = self._run_tests(container, self._test_cmd(repo, version), None,
+                              instance_id, "find_passing")
         status = self._parse(repo, version, instance_id, log)
         return [t for t, s in status.items() if s == TestStatus.PASSED.value]
 
@@ -244,7 +325,8 @@ class RegressionTester(BenchmarkEvaluation):
         if not self._apply_patch(container, patch_text):
             # Unappliable patch -> treat as failing everything (will be pruned).
             return list(regression_tests)
-        log = self._run_tests(container, self._test_cmd(repo, version), regression_tests)
+        log = self._run_tests(container, self._test_cmd(repo, version), regression_tests,
+                              instance_id, "validate")
         status = self._parse(repo, version, instance_id, log)
         failed = []
         for t in regression_tests:
@@ -264,7 +346,10 @@ class RegressionTester(BenchmarkEvaluation):
             print(f"[regr] {instance_id}: repo {repo} unsupported by swebench, skipping")
             return entry
 
+        import time as _time
+        _c0 = _time.time()
         container = self._start_container(instance_id)
+        _record_container_setup("prune", instance_id, _c0, _time.time())
         try:
             passing = self.find_passing_tests(container, repo, version, instance_id, instance)
             regression = self.select_regression_tests(entry.get("issue", ""), passing, instance_id)
@@ -299,8 +384,9 @@ class RegressionTester(BenchmarkEvaluation):
             entry["regressions"] = [rep_failed[rep_of[keys[i]]] for i in range(len(patches))]
             entry["regression_done"] = True
         finally:
-            container.stop()
-            container.remove()
+            # SIGKILL + remove in one; skip docker stop's 10s SIGTERM grace (the
+            # ephemeral container's PID 1 ignores SIGTERM). Saves ~10s per instance.
+            container.remove(force=True)
         return entry
 
     def run(self, candidates_path: str, output_path: str, max_workers: int):

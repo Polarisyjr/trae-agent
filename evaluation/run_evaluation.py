@@ -193,8 +193,7 @@ class BenchmarkEvaluation:
                 break
             if return_code is not None and return_code != 0:
                 print("Docker exec error. Error message: {}".format(output))
-                container.stop()
-                container.remove()
+                container.remove(force=True)   # skip docker stop's 10s SIGTERM grace
                 exit(-1)
 
         for tar_name, src_path in [
@@ -210,8 +209,8 @@ class BenchmarkEvaluation:
             except Exception:
                 print(f"Failed to save {tar_name} from container.")
 
-        container.stop()
-        container.remove()
+        # SIGKILL + remove; skip docker stop's 10s SIGTERM grace (PID 1 ignores it).
+        container.remove(force=True)
 
     def prepare_experiment_container(self, instance: dict[str, str]) -> Container:
         """
@@ -307,8 +306,8 @@ class BenchmarkEvaluation:
             print(f"{command} failed.")
             print(traceback.format_exc())
 
-        container.stop()
-        container.remove()
+        # SIGKILL + remove; skip docker stop's 10s SIGTERM grace (PID 1 ignores it).
+        container.remove(force=True)
 
     def run_all(self):
         """

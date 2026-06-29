@@ -15,6 +15,24 @@ from .selector_agent import CandidatePatch, SelectorAgent
 from .utils import clean_patch, get_trajectory_filename, save_patches, save_selection_success
 
 
+def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) -> None:
+    """Append a container-setup timing record (epoch wall) to $STEP3_CONTAINER_LOG
+    so step3's timeline can show the selector sandbox container startup (a fresh
+    container per group/retry). No-op when the env var is unset."""
+    import json
+    path = os.environ.get("STEP3_CONTAINER_LOG")
+    if not path:
+        return
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
+                                "wall_s": round(t1 - t0, 3), "stage": stage,
+                                "instance_id": instance_id,
+                                "kind": "container_setup"}) + "\n")
+    except OSError:
+        pass
+
+
 def run_instance(
     *,
     instance,
@@ -214,8 +232,11 @@ def run_instance_by_group(
                     sys.stderr.flush()
 
                     # sandbox & tools
+                    import time as _time
+                    _c0 = _time.time()
                     sandbox = Sandbox(namespace, image_name, tag, instance, tools_path)
                     sandbox.start_container()
+                    _record_container_setup("select", instance["instance_id"], _c0, _time.time())
                     project_path = sandbox.get_project_path()
                     print(f"[Retry No:{current_try}] sandbox & tools done")
                     sys.stdout.flush()
