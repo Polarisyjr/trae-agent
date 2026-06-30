@@ -108,7 +108,14 @@ class BenchmarkEvaluation:
         Check existence of required Docker images for all instances.
         Updates self.image_status dict.
         """
-        for item in tqdm(self.dataset, desc="Checking image status"):
+        # Only check the images for the instances we actually run. The full dataset
+        # is ~500 rows; checking every one does ~500 docker API calls per stage
+        # subprocess (generate/prune/select each pay it) for no reason when a run
+        # targets a handful of instances. Fall back to the whole dataset only when
+        # no subset was requested (instance_ids empty == run everything).
+        want = set(self.instance_ids or [])
+        items = [it for it in self.dataset if it["instance_id"] in want] if want else self.dataset
+        for item in tqdm(items, desc="Checking image status"):
             instance_id: str = item["instance_id"]
             image_name = self._image_name(instance_id)
             try:

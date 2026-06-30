@@ -70,7 +70,8 @@ from .run_evaluation import BenchmarkEvaluation
 DEFAULT_EVAL_PREFIX = "source /opt/miniconda3/bin/activate testbed && cd /testbed"
 
 
-def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) -> None:
+def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
+                            kind: str = "container_setup") -> None:
     """Append a container-setup timing record (epoch wall) to $STEP3_CONTAINER_LOG
     so step3's timeline can show docker container startup as its own lane. No-op
     when the env var is unset (normal non-profiled runs)."""
@@ -83,7 +84,7 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) 
             f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
                                 "wall_s": round(t1 - t0, 3), "stage": stage,
                                 "instance_id": instance_id,
-                                "kind": "container_setup"}) + "\n")
+                                "kind": kind}) + "\n")
     except OSError:
         pass
 
@@ -110,12 +111,18 @@ class RegressionTester(BenchmarkEvaluation):
 
     def __init__(self, *args, model_name: str, eval_prefix: str, universe: str,
                  max_tests_for_llm: int, test_timeout: int = 300,
-                 trajectory_dir: str | None = None, **kwargs):
+                 trajectory_dir: str | None = None, test_parallel: int | None = None,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.eval_prefix = eval_prefix
         self.universe = universe
         self.max_tests_for_llm = max_tests_for_llm
         self.test_timeout = test_timeout
+        # Override the runner's process count for test_cmds that support it (django's
+        # runtests.py `--parallel N`). The SWE-bench spec hardcodes `--parallel 1`,
+        # which on a many-core host makes the whole-suite find_passing run ~Ncpu times
+        # slower than it needs to be. None -> leave the spec's test_cmd untouched.
+        self.test_parallel = test_parallel
         # Per-instance trajectory files, so the regression LLM call lands in the same
         # `llm_interactions[]` turn format as the generate/selector stages (normalized).
         self.trajectory_dir = trajectory_dir
@@ -246,7 +253,13 @@ class RegressionTester(BenchmarkEvaluation):
     # --- pipeline steps ------------------------------------------------------
 
     def _test_cmd(self, repo: str, version: str) -> str:
-        return MAP_REPO_VERSION_TO_SPECS[repo][version]["test_cmd"]
+        cmd = MAP_REPO_VERSION_TO_SPECS[repo][version]["test_cmd"]
+        # Bump parallelism if requested AND the runner supports it. Only rewrite an
+        # existing `--parallel N` token (django); never inject the flag elsewhere
+        # (pytest/sympy/etc. don't understand it), so this is a no-op for those repos.
+        if self.test_parallel and "--parallel" in cmd:
+            cmd = re.sub(r"--parallel\s+\d+", f"--parallel {self.test_parallel}", cmd)
+        return cmd
 
     def find_passing_tests(self, container, repo, version, instance_id, instance) -> list[str]:
         """Step 1: tests that pass in the pristine repo."""
@@ -386,7 +399,10 @@ class RegressionTester(BenchmarkEvaluation):
         finally:
             # SIGKILL + remove in one; skip docker stop's 10s SIGTERM grace (the
             # ephemeral container's PID 1 ignores SIGTERM). Saves ~10s per instance.
+            _td0 = _time.time()
             container.remove(force=True)
+            _record_container_setup("prune", instance_id, _td0, _time.time(),
+                                    kind="container_teardown")
         return entry
 
     def run(self, candidates_path: str, output_path: str, max_workers: int):
@@ -455,6 +471,9 @@ def main():
                         "LLM call as a turn (normalized with generate/selector). Defaults to "
                         "<output_dir>/regression_trajectories; pass '' to disable.")
     p.add_argument("--max_workers", type=int, default=4, help="Parallel workers across instances.")
+    p.add_argument("--test-parallel", type=int, default=None,
+                   help="Override the runner's process count for test_cmds that support it "
+                        "(django runtests.py '--parallel N'). No-op for runners without the flag.")
     args = p.parse_args()
 
     # Default: write trajectories next to the pruned output so the turn counter finds
@@ -484,6 +503,7 @@ def main():
         max_tests_for_llm=args.max_tests_for_llm,
         test_timeout=args.test_timeout,
         trajectory_dir=args.trajectory_dir,
+        test_parallel=args.test_parallel,
     )
     tester.run(args.candidates, args.output, args.max_workers)
 

@@ -42,7 +42,8 @@ from .run_evaluation import BenchmarkEvaluation
 from .utils import docker_exec
 
 
-def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) -> None:
+def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
+                            kind: str = "container_setup") -> None:
     """Append a container-setup timing record (epoch wall) to $STEP3_CONTAINER_LOG
     so step3's timeline can show docker container startup as its own lane (generate
     builds + injects trae-agent into the instance container ONCE here, then reuses it
@@ -56,7 +57,7 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) 
             f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
                                 "wall_s": round(t1 - t0, 3), "stage": stage,
                                 "instance_id": instance_id,
-                                "kind": "container_setup"}) + "\n")
+                                "kind": kind}) + "\n")
     except OSError:
         pass
 
@@ -137,7 +138,10 @@ class CandidateGeneration(BenchmarkEvaluation):
             # SIGKILL + remove in one; skip docker stop's 10s SIGTERM grace (the
             # container's PID 1 ignores SIGTERM, so stop() always waits the full
             # default timeout). Saves ~10s of dead time at this stage's teardown.
+            _td0 = _time.time()
             container.remove(force=True)
+            _record_container_setup("generate", instance_id, _td0, _time.time(),
+                                    kind="container_teardown")
 
         if len(patches) < num_candidate:
             print(f"[{instance_id}] WARNING: only {len(patches)}/{num_candidate} after "

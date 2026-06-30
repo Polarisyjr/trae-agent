@@ -15,7 +15,8 @@ from .selector_agent import CandidatePatch, SelectorAgent
 from .utils import clean_patch, get_trajectory_filename, save_patches, save_selection_success
 
 
-def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) -> None:
+def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
+                            kind: str = "container_setup") -> None:
     """Append a container-setup timing record (epoch wall) to $STEP3_CONTAINER_LOG
     so step3's timeline can show the selector sandbox container startup (a fresh
     container per group/retry). No-op when the env var is unset."""
@@ -28,7 +29,7 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float) 
             f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
                                 "wall_s": round(t1 - t0, 3), "stage": stage,
                                 "instance_id": instance_id,
-                                "kind": "container_setup"}) + "\n")
+                                "kind": kind}) + "\n")
     except OSError:
         pass
 
@@ -312,7 +313,10 @@ def run_instance_by_group(
                         is_success=is_success_patch,
                         group_id=group_id,
                     )
+                    _td0 = _time.time()
                     sandbox.stop_container()
+                    _record_container_setup("select", instance["instance_id"], _td0,
+                                            _time.time(), kind="container_teardown")
                     break
                 except Exception as e:
                     print(f"Error occurred: {e}")
