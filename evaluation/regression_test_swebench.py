@@ -9,12 +9,26 @@ gold FAIL_TO_PASS/PASS_TO_PASS labels by default):
 
   1. Find passing tests: run the repo's test suite on the pristine codebase and keep
      the tests that PASS. (No LLM.)
-  2. Select regression tests: ask the LLM to keep only the subset that a correct fix
-     should NOT change (a correct issue resolution may legitimately alter some
-     behaviour, so blindly requiring every old test to pass would discard good
-     patches). (LLM — via your trae_config.yaml model, e.g. vLLM.)
+  2. Select regression tests: ask the LLM to name only the FEW passing tests a correct
+     fix may legitimately change (e.g. a test asserting the buggy behaviour); everything
+     else is kept as a regression test. Exclusion framing (vs. "list the subset to keep")
+     keeps the LLM output tiny — usually empty — instead of forcing it to re-emit the
+     whole passing list verbatim, which is slow and degenerates into a blind echo.
+     (LLM — via your trae_config.yaml model, e.g. vLLM.)
   3. Validate each candidate: apply the patch, run the selected regression tests, and
      record which fail. (No LLM.)
+
+Test names are adapted per repo before they can be re-run (`test_directives`): the
+parser emits names in a runner-specific format that is not always a valid CLI selector
+(django's "method (module.Class)" must become "module.Class.method"; sympy's passing
+tests come back as bare function names that bin/test can't address -> whole-suite).
+Parallelism (`_shard_plan` / `_run_partitioned`) prefers NATIVE in-container parallelism
+— one container, the runner parallelizes inside — which far outperforms a many-container
+fan-out (a single Python process driving many blocking exec streams stalls under
+GIL/docker/disk contention). django uses `runtests.py --parallel N`; pytest uses
+`pytest -n N` on a pre-built `:xdist` image (see build_xdist_images.py); only sympy, which
+has neither native parallelism nor per-test selection, falls back to a small capped
+`bin/test --split` container fan-out. The `test_parallel` knob (n) drives all three.
 
 Per Figure 2 (Patch Pruning = deduplication THEN regression testing), candidates are
 deduplicated (via the selector's `clean_patch` normalization) BEFORE step 3, so the
@@ -88,20 +102,82 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
     except OSError:
         pass
 
+# Repos whose parser (MAP_REPO_TO_PARSER) emits test names that are NOT valid
+# arguments to their own test_cmd, so the names must be adapted before they can be
+# passed back to select those tests. See `test_directives` below for the full audit.
+_DJANGO_NAME_RE = re.compile(r"^(?P<method>\S+)\s+\((?P<path>[\w.]+)\)$")
+
+# The SWE-bench-Verified repos whose test_cmd is pytest-based (directly, or via tox's
+# `--`). These get in-container `pytest -n N` parallelism using the pre-built `:xdist`
+# image (see build_xdist_images.py). django uses native `runtests.py --parallel`; sympy
+# uses `bin/test --split`; neither is in this set.
+PYTEST_REPOS = {
+    "sphinx-doc/sphinx", "matplotlib/matplotlib", "scikit-learn/scikit-learn",
+    "astropy/astropy", "pydata/xarray", "pytest-dev/pytest",
+    "pylint-dev/pylint", "psf/requests", "mwaskom/seaborn", "pallets/flask",
+}
+
+
+def test_directives(repo: str, names: list[str]) -> list[str] | None:
+    """Unified adapter: turn parser-emitted test names into CLI selector tokens for
+    `repo`'s test_cmd, so `find_passing` names round-trip into a runnable `validate`
+    selection across ALL SWE-bench(-Verified) repos.
+
+    Returns None when the repo's parser output cannot address individual tests at all;
+    the caller must then run the WHOLE suite and filter by re-parsing (correct, slower).
+
+    Audit of the 12 SWE-bench-Verified repos (parser -> emitted format -> runner arg):
+      * django/django   parse_log_django   "method (dotted.module.Class)"  ->  runtests.py
+        wants "dotted.module.Class.method". FLIP required (else the whole cmd errors out
+        and every test is spuriously marked failed).
+      * sympy/sympy     parse_log_sympy    passing tests are BARE "test_func" (the file
+        path is lost by the parser) -> bin/test selects by file path / -k, so a bare
+        function name cannot address a specific test. NOT selectable -> whole-suite.
+      * pylint / requests  parse_log_pytest_options truncates path-like "[/a/b/c]"
+        parametrize ids to "[/c]", so the exact node id is unrecoverable. Drop the
+        path-like param and select at function granularity (a safe superset; the
+        specific param's status is still read back from the re-parsed output).
+      * everyone else (sphinx, matplotlib, scikit-learn, astropy, xarray, pytest,
+        seaborn, flask): pytest node ids "path::Class::test[param]" ARE valid pytest
+        args and round-trip as-is (sphinx appends them after tox's `--`). Identity.
+    """
+    if repo == "django/django":
+        out = []
+        for n in names:
+            m = _DJANGO_NAME_RE.match(n.strip())
+            out.append(f"{m['path']}.{m['method']}" if m else n)
+        return out
+    if repo == "sympy/sympy":
+        return None  # bare function names -> not addressable via bin/test
+    if repo in ("pylint-dev/pylint", "psf/requests"):
+        # Strip a path-like "[/...]" param (the parser already mangled it) and select
+        # the parametrized test at function level; dedupe while preserving order.
+        stripped = [re.sub(r"\[/.*\]$", "", n) for n in names]
+        return list(dict.fromkeys(stripped))
+    return list(names)  # pytest node ids round-trip unchanged
+
+
 SELECT_PROMPT = """You are selecting regression tests for a software issue.
 
-You are given a GitHub issue and a list of tests that currently PASS in the repository.
-Identify the subset of these tests that should STILL pass after a correct fix for the
-issue — i.e. tests whose behaviour a correct resolution is NOT expected to change.
-Exclude tests that the fix may legitimately alter (e.g. tests asserting the very buggy
-behaviour described in the issue).
+You are given a GitHub issue and a list of tests that currently PASS in the pristine
+repository. By default, a passing test should remain a regression test: a correct fix
+should not break existing behavior.
 
-Return ONLY a JSON array of test names, each chosen verbatim from the provided list.
+Your job is to identify ONLY the tests whose expected behavior may legitimately change
+after a correct fix for this issue. These tests should be EXCLUDED from the regression
+set. Do NOT list tests merely because they seem unrelated, redundant, broad, or expensive;
+unrelated passing tests should still be kept as regression tests.
+
+Exclude a test only if it appears to assert behavior that the issue says is buggy,
+obsolete, or intentionally changed by the fix.
+
+Return ONLY a JSON array of test names to EXCLUDE, each verbatim from the list below.
+Return [] if none of the passing tests should be excluded.
 
 ## Issue
 {issue}
 
-## Passing tests (choose from these only)
+## Passing tests
 {tests}
 """
 
@@ -118,10 +194,12 @@ class RegressionTester(BenchmarkEvaluation):
         self.universe = universe
         self.max_tests_for_llm = max_tests_for_llm
         self.test_timeout = test_timeout
-        # Override the runner's process count for test_cmds that support it (django's
-        # runtests.py `--parallel N`). The SWE-bench spec hardcodes `--parallel 1`,
-        # which on a many-core host makes the whole-suite find_passing run ~Ncpu times
-        # slower than it needs to be. None -> leave the spec's test_cmd untouched.
+        # Unified parallelism degree n: each test run is partitioned into n shards, each
+        # executed in its OWN fresh container concurrently (see `_shard_plan`). Works for
+        # EVERY SWE-bench repo — django/pytest shard the test-id list, sympy shards via
+        # `bin/test --split`, and django's whole-suite discovery uses native --parallel n.
+        # None/1 -> no fan-out (single container, serial). This replaces the old
+        # django-only `--parallel N` knob.
         self.test_parallel = test_parallel
         # Per-instance trajectory files, so the regression LLM call lands in the same
         # `llm_interactions[]` turn format as the generate/selector stages (normalized).
@@ -136,12 +214,40 @@ class RegressionTester(BenchmarkEvaluation):
 
     # --- container helpers ---------------------------------------------------
 
-    def _start_container(self, instance_id: str):
+    @staticmethod
+    def _xdist_tag(base_image: str) -> str:
+        """`<repo>:latest` -> `<repo>:xdist` (the derived image with pytest-xdist baked
+        in by build_xdist_images.py)."""
+        return f"{base_image.rsplit(':', 1)[0]}:xdist"
+
+    def _pick_image(self, instance_id: str, repo: str) -> str:
+        """Prefer the pre-built `:xdist` image for pytest repos so `pytest -n N` works
+        without a per-container install. Falls back to the base image (serial pytest)
+        when no xdist image was built for this instance."""
+        base = self._image_name(instance_id)
+        if repo in PYTEST_REPOS:
+            xt = self._xdist_tag(base)
+            try:
+                self.docker_client.images.get(xt)
+                return xt
+            except Exception:
+                pass
+        return base
+
+    def _start_container(self, instance_id: str, repo: str = ""):
+        # Override the image ENTRYPOINT with a keepalive: some SWE-bench images ship a
+        # custom entrypoint that runs a setup script and EXITS (e.g. requests seds a
+        # timeout into test_requests.py), which would make `command=/bin/bash` a no-op arg
+        # and kill the container immediately. `tail -f /dev/null` keeps every image alive
+        # regardless of its entrypoint; we exec our own test commands into it.
         return self.docker_client.containers.run(
-            self._image_name(instance_id),
-            command="/bin/bash",
-            detach=True, tty=True, stdin_open=True,
+            self._pick_image(instance_id, repo),
+            entrypoint=["tail", "-f", "/dev/null"],
+            detach=True,
         )
+
+    def _has_xdist(self, instance_id: str, repo: str) -> bool:
+        return self._pick_image(instance_id, repo) != self._image_name(instance_id)
 
     def _bash(self, container, command: str):
         # Pass argv as a LIST so docker-py sends it as-is instead of shlex-splitting a
@@ -150,9 +256,6 @@ class RegressionTester(BenchmarkEvaluation):
         # wrap (shlex raises "No closing quotation"). A list sidesteps the split entirely.
         rc, out = container.exec_run(cmd=["/bin/bash", "-c", command])
         return rc, out.decode("utf-8")
-
-    def _reset_repo(self, container):
-        self._bash(container, "cd /testbed && git checkout -- . && git clean -fdq")
 
     def _apply_patch(self, container, patch_text: str) -> bool:
         # Copy the patch into the container, then try git apply with patch(1) fallback.
@@ -202,15 +305,21 @@ class RegressionTester(BenchmarkEvaluation):
         return None
 
     def _run_tests(self, container, test_cmd: str, test_ids: list[str] | None,
-                   instance_id: str = "", phase: str = "test") -> str:
-        ids = (" " + " ".join(test_ids)) if test_ids else ""
-        # Wrap in `timeout` so a hanging test (e.g. requests network tests with no
-        # connectivity) can't block the whole stage indefinitely. On timeout the run is
-        # killed; tests with no PASSED line are then treated as failed (conservative).
-        # `env` so a test_cmd with a leading VAR=val (e.g. sympy's
-        # "PYTHONWARNINGS='...' bin/test") works: without it `timeout` treats the
-        # assignment as the program name and dies with rc 127 in <1s (0 passing).
-        cmd = f"{self.eval_prefix} && timeout {self.test_timeout} env {test_cmd}{ids}"
+                   instance_id: str = "", phase: str = "test", wrap: bool = True) -> str:
+        if wrap:
+            ids = (" " + " ".join(test_ids)) if test_ids else ""
+            # Wrap in `timeout` so a hanging test (e.g. requests network tests with no
+            # connectivity) can't block the whole stage indefinitely. On timeout the run is
+            # killed; tests with no PASSED line are then treated as failed (conservative).
+            # `env` so a test_cmd with a leading VAR=val (e.g. sympy's
+            # "PYTHONWARNINGS='...' bin/test") works: without it `timeout` treats the
+            # assignment as the program name and dies with rc 127 in <1s (0 passing).
+            cmd = f"{self.eval_prefix} && timeout {self.test_timeout} env {test_cmd}{ids}"
+        else:
+            # test_cmd is already a complete shell command (e.g. sympy's background
+            # `--split` fan-out with its own per-process `timeout`/`env`). Run as-is so we
+            # don't double-wrap `env`/`timeout` around a compound command.
+            cmd = f"{self.eval_prefix} && {test_cmd}"
         # Measure the test-suite run: wall-clock + container CPU-seconds (cgroup delta
         # around the exec). Excludes container startup (already running) and the
         # reset/apply done in separate exec calls — just this test run + its eval_prefix.
@@ -252,54 +361,160 @@ class RegressionTester(BenchmarkEvaluation):
 
     # --- pipeline steps ------------------------------------------------------
 
-    def _test_cmd(self, repo: str, version: str) -> str:
+    def _test_cmd(self, repo: str, version: str, parallel: int | None = None) -> str:
         cmd = MAP_REPO_VERSION_TO_SPECS[repo][version]["test_cmd"]
-        # Bump parallelism if requested AND the runner supports it. Only rewrite an
-        # existing `--parallel N` token (django); never inject the flag elsewhere
-        # (pytest/sympy/etc. don't understand it), so this is a no-op for those repos.
-        if self.test_parallel and "--parallel" in cmd:
-            cmd = re.sub(r"--parallel\s+\d+", f"--parallel {self.test_parallel}", cmd)
+        # Rewrite django's in-runner `--parallel N` token when asked (native DB-cloning
+        # parallelism, used for the whole-suite find_passing where we have no ids to
+        # shard). No-op for runners without the flag (pytest/sympy).
+        if parallel is not None and "--parallel" in cmd:
+            cmd = re.sub(r"--parallel\s+\d+", f"--parallel {parallel}", cmd)
         return cmd
 
-    def find_passing_tests(self, container, repo, version, instance_id, instance) -> list[str]:
-        """Step 1: tests that pass in the pristine repo."""
+    # --- unified parallelism (native-in-container, xdist baked in) -----------
+
+    # sympy is the only runner with neither native in-process parallelism nor id
+    # selection; it is parallelized by a few concurrent `bin/test --split` processes,
+    # each in its own container. Keep the fan-out small — a single Python process driving
+    # blocking exec_run streams stalls at high concurrency (GIL + docker + disk), so a
+    # big fan-out is both slow and wrong (stalled shards mark their tests failed).
+    _SYMPY_SPLIT_CAP = 8
+    _SHARD_CONCURRENCY_CAP = 8
+
+    @staticmethod
+    def _inject_pytest_n(cmd: str, n: int) -> str:
+        """Add `-n N` (pytest-xdist). Appending works both for a bare `pytest ...` cmd and
+        for tox's `... --` form (args after `--` go to pytest). Only inject when n>1 (i.e.
+        the `:xdist` image is present); otherwise leave the cmd serial."""
+        return f"{cmd} -n {n}" if n and n > 1 else cmd
+
+    def _shard_plan(self, repo: str, version: str, directives: list[str] | None,
+                    n: int, pytest_n: int) -> list[tuple[str, list[str] | None]]:
+        """Return the (cmd, ids) shards to run. The design goal is find_passing-style
+        NATIVE in-container parallelism (one container, the runner parallelizes inside),
+        which massively outperforms a many-container fan-out:
+
+          * django  -> ONE container: `runtests.py --parallel n <labels>` (labels for
+            validate, none for find_passing). DB-cloning parallelism inside the container.
+          * pytest  -> ONE container: `pytest -n <pytest_n> <ids>` on the pre-built
+            `:xdist` image. pytest_n is n when xdist is available, else 1 (serial).
+          * sympy   -> no native parallelism and no id selection, so run a few
+            `bin/test --split i/k` shards, each in its own container (k capped).
+        """
+        n = max(1, n)
+        if repo == "django/django":
+            return [(self._test_cmd(repo, version, parallel=n), directives)]
+        if repo in PYTEST_REPOS:
+            cmd = self._inject_pytest_n(self._test_cmd(repo, version), pytest_n)
+            return [(cmd, directives)]
+        if repo == "sympy/sympy" and directives is None and n > 1:
+            k = min(n, self._SYMPY_SPLIT_CAP)
+            base = self._test_cmd(repo, version)
+            return [(f"{base} --split {i + 1}/{k}", None) for i in range(k)]
+        # sympy at n<=1, or any unknown runner: one serial container.
+        return [(self._test_cmd(repo, version), directives)]
+
+    def _run_partitioned(self, repo: str, version: str, instance_id: str, phase: str,
+                         directives: list[str] | None, patch_text: str | None,
+                         n: int) -> tuple[dict[str, str], bool]:
+        """Run the shard plan and merge the per-shard parsed statuses. django/pytest yield
+        ONE shard (native in-container parallelism); only sympy yields a small capped
+        fan-out. Returns (merged_status, apply_failed).
+
+        Each shard runs in its own fresh container (already at base_commit, so no git
+        reset — validate just applies the candidate patch)."""
+        pytest_n = n if self._has_xdist(instance_id, repo) else 1
+        shards = self._shard_plan(repo, version, directives, n, pytest_n)
+        merged: dict[str, str] = {}
+        apply_failed = False
+        lock = threading.Lock()
+
+        def _one(cmd: str, ids: list[str] | None):
+            nonlocal apply_failed
+            import time
+            t0 = time.time()
+            container = self._start_container(instance_id, repo)
+            _record_container_setup(phase, instance_id, t0, time.time())
+            try:
+                if patch_text is not None and not self._apply_patch(container, patch_text):
+                    with lock:
+                        apply_failed = True
+                    return
+                log = self._run_tests(container, cmd, ids, instance_id, phase)
+                status = self._parse(repo, version, instance_id, log)
+                with lock:
+                    merged.update(status)
+            finally:
+                _td0 = time.time()
+                container.remove(force=True)
+                _record_container_setup(phase, instance_id, _td0, time.time(),
+                                        kind="container_teardown")
+
+        workers = min(len(shards), self._SHARD_CONCURRENCY_CAP)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(lambda s: _one(*s), shards))
+        return merged, apply_failed
+
+    def find_passing_tests(self, repo, version, instance_id, instance) -> list[str]:
+        """Step 1: tests that pass in the pristine repo (whole-suite run, sharded)."""
         if self.universe == "pass_to_pass":
             # Fast (less fair): trust SWE-bench's curated pass-to-pass set as the universe.
             return json.loads(instance.get("PASS_TO_PASS", "[]"))
-        # Faithful: run the whole suite (bare test_cmd runs everything) and keep passers.
-        self._reset_repo(container)
-        log = self._run_tests(container, self._test_cmd(repo, version), None,
-                              instance_id, "find_passing")
-        status = self._parse(repo, version, instance_id, log)
+        # Faithful: run the whole suite and keep passers. directives=None -> the shard
+        # plan uses the whole-suite parallelism for this runner (django --parallel /
+        # sympy --split / pytest serial).
+        status, _ = self._run_partitioned(repo, version, instance_id, "find_passing",
+                                           directives=None, patch_text=None,
+                                           n=self.test_parallel or 1)
         return [t for t, s in status.items() if s == TestStatus.PASSED.value]
+
+    # Max passing-test names to put in ONE select prompt. The full list is processed in
+    # batches of this size (per-batch exclusions unioned), so a large suite (django's
+    # ~11.5k passing tests) never overflows the model context in a single call. Sized
+    # well under a 128k-token window, leaving room for the issue text and a worst-case
+    # (echo-sized) exclusion output.
+    _LLM_BATCH = 2000
 
     def select_regression_tests(self, issue: str, passing: list[str],
                                 instance_id: str = "") -> list[str]:
-        """Step 2: LLM keeps the subset that a correct fix should not change."""
+        """Step 2: LLM names the few tests a correct fix may change; keep the rest.
+
+        Exclusion framing (ask for the drop-list, not the keep-list) so the LLM output
+        is tiny — normally empty — instead of re-emitting all N passing test names
+        verbatim (which is decode-bound slow and degenerates into a blind echo).
+
+        The passing list is processed in context-safe batches of _LLM_BATCH (the per-batch
+        exclusion sets are unioned), so an arbitrarily large suite is handled without
+        overflowing the model context or silently dropping tests."""
         if not passing:
             return []
-        shown = passing
-        if len(shown) > self.max_tests_for_llm:
-            print(f"[regr] {len(shown)} passing tests > cap {self.max_tests_for_llm}; truncating "
-                  f"for the LLM prompt (rest are dropped from the regression set)")
-            shown = shown[: self.max_tests_for_llm]
-        prompt = SELECT_PROMPT.format(issue=issue, tests="\n".join(shown))
-        messages = [LLMMessage(role="user", content=prompt)]
-        resp = self.llm_client.chat(messages, self.model_config, None, reuse_history=False)
-        self._record_turn(instance_id, messages, resp)
-        selected = self._extract_json_list(resp.content)
-        passing_set = set(shown)
-        # Keep only valid picks; if the LLM returns nothing usable, fall back to all shown.
-        chosen = [t for t in selected if t in passing_set]
-        return chosen or shown
+        shown = passing[: self.max_tests_for_llm]
+        if len(passing) > self.max_tests_for_llm:
+            print(f"[regr] {len(passing)} passing tests > cap {self.max_tests_for_llm}; "
+                  f"considering the first {self.max_tests_for_llm}")
+        excluded: set[str] = set()
+        turns = []
+        for start in range(0, len(shown), self._LLM_BATCH):
+            batch = shown[start:start + self._LLM_BATCH]
+            prompt = SELECT_PROMPT.format(issue=issue, tests="\n".join(batch))
+            messages = [LLMMessage(role="user", content=prompt)]
+            resp = self.llm_client.chat(messages, self.model_config, None, reuse_history=False)
+            turns.append((messages, resp))
+            batch_set = set(batch)
+            # Only honour exclusions that name a real test in THIS batch.
+            excluded |= {t for t in self._extract_json_list(resp.content) if t in batch_set}
+        self._record_turns(instance_id, turns)
+        # Everything shown except the few legitimately-changeable tests. Empty/garbage
+        # responses -> exclude nothing -> keep all (the paper's conservative default).
+        return [t for t in shown if t not in excluded]
 
-    def _record_turn(self, instance_id: str, messages, response) -> None:
-        """Record the single regression LLM call as one turn in `llm_interactions[]`,
-        matching the generate/selector trajectory format. One file per instance.
+    def _record_turns(self, instance_id: str, turns) -> None:
+        """Record the regression LLM call(s) as turns in `llm_interactions[]`, matching
+        the generate/selector trajectory format. One file per instance; batched selection
+        makes >1 call, so record them all as consecutive turns.
 
-        A fresh recorder per call keeps this thread-safe across the instance-level
+        A fresh recorder here keeps this thread-safe across the instance-level
         ThreadPoolExecutor (the shared self.llm_client has no recorder attached)."""
-        if not self.trajectory_dir:
+        if not self.trajectory_dir or not turns:
             return
         try:
             provider = self.model_config.model_provider.provider
@@ -309,12 +524,15 @@ class RegressionTester(BenchmarkEvaluation):
                 task=f"regression test selection: {instance_id}",
                 provider=provider,
                 model=self.model_config.model,
-                max_steps=1,
+                max_steps=len(turns),
             )
-            recorder.record_llm_interaction(
-                messages, response, provider, self.model_config.model, None
-            )
-            recorder.finalize_recording(True, response.content)
+            last = None
+            for messages, response in turns:
+                recorder.record_llm_interaction(
+                    messages, response, provider, self.model_config.model, None
+                )
+                last = response
+            recorder.finalize_recording(True, last.content if last else "")
         except Exception as e:
             print(f"[regr] {instance_id}: failed to record trajectory: {e}")
 
@@ -329,24 +547,23 @@ class RegressionTester(BenchmarkEvaluation):
         except json.JSONDecodeError:
             return []
 
-    def validate_candidate(self, container, repo, version, instance_id, regression_tests,
+    def validate_candidate(self, repo, version, instance_id, regression_tests,
                            patch_text) -> list[str]:
-        """Step 3: failed regression tests for one candidate patch."""
+        """Step 3: failed regression tests for one candidate patch (sharded)."""
         if not regression_tests:
             return []
-        self._reset_repo(container)
-        if not self._apply_patch(container, patch_text):
+        # Adapt parser-emitted names into runnable CLI selectors. None -> the repo can't
+        # address individual tests (sympy's bare names); the shard plan then runs the
+        # whole suite (via --split) and we filter by re-parsing.
+        directives = test_directives(repo, regression_tests)
+        status, apply_failed = self._run_partitioned(
+            repo, version, instance_id, "validate",
+            directives=directives, patch_text=patch_text, n=self.test_parallel or 1)
+        if apply_failed:
             # Unappliable patch -> treat as failing everything (will be pruned).
             return list(regression_tests)
-        log = self._run_tests(container, self._test_cmd(repo, version), regression_tests,
-                              instance_id, "validate")
-        status = self._parse(repo, version, instance_id, log)
-        failed = []
-        for t in regression_tests:
-            # A regression test must PASS; anything else (fail/error/missing) is a failure.
-            if status.get(t) != TestStatus.PASSED.value:
-                failed.append(t)
-        return failed
+        # A regression test must PASS; anything else (fail/error/missing) is a failure.
+        return [t for t in regression_tests if status.get(t) != TestStatus.PASSED.value]
 
     def process_instance(self, entry: dict) -> dict:
         instance_id = entry["instance_id"]
@@ -359,50 +576,40 @@ class RegressionTester(BenchmarkEvaluation):
             print(f"[regr] {instance_id}: repo {repo} unsupported by swebench, skipping")
             return entry
 
-        import time as _time
-        _c0 = _time.time()
-        container = self._start_container(instance_id)
-        _record_container_setup("prune", instance_id, _c0, _time.time())
-        try:
-            passing = self.find_passing_tests(container, repo, version, instance_id, instance)
-            regression = self.select_regression_tests(entry.get("issue", ""), passing, instance_id)
+        # Containers are now created per shard inside _run_partitioned (container-per-
+        # shard parallelism), so there is no instance-level container to manage here.
+        passing = self.find_passing_tests(repo, version, instance_id, instance)
+        regression = self.select_regression_tests(entry.get("issue", ""), passing, instance_id)
 
-            # Figure 2 order: deduplicate BEFORE regression testing, so the expensive
-            # tests run once per unique patch (duplicates share their representative's
-            # result). Uses the same clean_patch normalization as the selector.
-            patches = entry["patches"]
-            keys = []
-            for i, p in enumerate(patches):
-                try:
-                    keys.append(clean_patch(p))
-                except Exception:
-                    keys.append(f"__unparsable_{i}__")  # treat as its own class
-            rep_of: dict[str, int] = {}
-            for i, k in enumerate(keys):
-                rep_of.setdefault(k, i)
-            unique_reps = sorted(set(rep_of.values()))
-            print(f"[regr] {instance_id}: {len(passing)} passing -> {len(regression)} regression "
-                  f"tests; {len(patches)} candidates -> {len(unique_reps)} unique (dedup first)")
+        # Figure 2 order: deduplicate BEFORE regression testing, so the expensive
+        # tests run once per unique patch (duplicates share their representative's
+        # result). Uses the same clean_patch normalization as the selector.
+        patches = entry["patches"]
+        keys = []
+        for i, p in enumerate(patches):
+            try:
+                keys.append(clean_patch(p))
+            except Exception:
+                keys.append(f"__unparsable_{i}__")  # treat as its own class
+        rep_of: dict[str, int] = {}
+        for i, k in enumerate(keys):
+            rep_of.setdefault(k, i)
+        unique_reps = sorted(set(rep_of.values()))
+        print(f"[regr] {instance_id}: {len(passing)} passing -> {len(regression)} regression "
+              f"tests; {len(patches)} candidates -> {len(unique_reps)} unique (dedup first)")
 
-            rep_failed = {}
-            for i in unique_reps:
-                failed = self.validate_candidate(
-                    container, repo, version, instance_id, regression, patches[i]
-                )
-                rep_failed[i] = failed
-                print(f"[regr]   {instance_id} cand {i}: "
-                      f"{'PASS' if not failed else f'{len(failed)} failed'}")
+        rep_failed = {}
+        for i in unique_reps:
+            failed = self.validate_candidate(
+                repo, version, instance_id, regression, patches[i]
+            )
+            rep_failed[i] = failed
+            print(f"[regr]   {instance_id} cand {i}: "
+                  f"{'PASS' if not failed else f'{len(failed)} failed'}")
 
-            # Propagate each representative's result to its duplicates.
-            entry["regressions"] = [rep_failed[rep_of[keys[i]]] for i in range(len(patches))]
-            entry["regression_done"] = True
-        finally:
-            # SIGKILL + remove in one; skip docker stop's 10s SIGTERM grace (the
-            # ephemeral container's PID 1 ignores SIGTERM). Saves ~10s per instance.
-            _td0 = _time.time()
-            container.remove(force=True)
-            _record_container_setup("prune", instance_id, _td0, _time.time(),
-                                    kind="container_teardown")
+        # Propagate each representative's result to its duplicates.
+        entry["regressions"] = [rep_failed[rep_of[keys[i]]] for i in range(len(patches))]
+        entry["regression_done"] = True
         return entry
 
     def run(self, candidates_path: str, output_path: str, max_workers: int):
@@ -472,8 +679,10 @@ def main():
                         "<output_dir>/regression_trajectories; pass '' to disable.")
     p.add_argument("--max_workers", type=int, default=4, help="Parallel workers across instances.")
     p.add_argument("--test-parallel", type=int, default=None,
-                   help="Override the runner's process count for test_cmds that support it "
-                        "(django runtests.py '--parallel N'). No-op for runners without the flag.")
+                   help="Unified parallelism degree n: partition each test run into n "
+                        "shards, each in its own container (works for every repo — id "
+                        "sharding for django/pytest, 'bin/test --split' for sympy, native "
+                        "--parallel for django's whole-suite discovery). None/1 = serial.")
     args = p.parse_args()
 
     # Default: write trajectories next to the pruned output so the turn counter finds
