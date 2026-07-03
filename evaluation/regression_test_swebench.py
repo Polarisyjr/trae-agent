@@ -20,15 +20,17 @@ gold FAIL_TO_PASS/PASS_TO_PASS labels by default):
 
 Test names are adapted per repo before they can be re-run (`test_directives`): the
 parser emits names in a runner-specific format that is not always a valid CLI selector
-(django's "method (module.Class)" must become "module.Class.method"; sympy's passing
-tests come back as bare function names that bin/test can't address -> whole-suite).
+(django's "method (module.Class)" must become "module.Class.method"; sympy is parsed by
+`parse_sympy_addressable` into file-addressable "file.py::test_name" and selected at exact
+test granularity via an in-process matches() patch).
 Parallelism (`_shard_plan` / `_run_partitioned`) prefers NATIVE in-container parallelism
 — one container, the runner parallelizes inside — which far outperforms a many-container
 fan-out (a single Python process driving many blocking exec streams stalls under
 GIL/docker/disk contention). django uses `runtests.py --parallel N`; pytest uses
-`pytest -n N` on a pre-built `:xdist` image (see build_xdist_images.py); only sympy, which
-has neither native parallelism nor per-test selection, falls back to a small capped
-`bin/test --split` container fan-out. The `test_parallel` knob (n) drives all three.
+`pytest -n N` on a pre-built `:xdist` image (see build_xdist_images.py); sympy, which has
+neither native parallelism nor a CLI test selector, runs n `bin/test --split i/n` shards
+BACKGROUNDED inside ONE container (concurrency container-side, so the host drains a single
+exec stream). The `test_parallel` knob (n) drives all three.
 
 Per Figure 2 (Patch Pruning = deduplication THEN regression testing), candidates are
 deduplicated (via the selector's `clean_patch` normalization) BEFORE step 3, so the
@@ -59,6 +61,7 @@ import argparse
 import io
 import json
 import os
+import random
 import re
 import tarfile
 import threading
@@ -107,6 +110,36 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
 # passed back to select those tests. See `test_directives` below for the full audit.
 _DJANGO_NAME_RE = re.compile(r"^(?P<method>\S+)\s+\((?P<path>[\w.]+)\)$")
 
+# sympy `bin/test --verbose` groups each file's results under a header line
+# `sympy/.../test_file.py[N]`, then lists bare `test_name ok|F|E`. The stock swebench
+# parser keeps only the bare name (loses the file, collides across files, and can't be
+# re-selected). We parse the header + results ourselves to name tests uniquely and
+# addressably as `sympy/.../test_file.py::test_name`.
+_SYMPY_FILE_RE = re.compile(r"^(sympy/[\w./]+\.py)\[\d+\]")
+_SYMPY_RESULT_RE = re.compile(r"^(test_\w+)\s+(ok|F|E|Skipped|s)\b")
+
+
+def parse_sympy_addressable(log: str) -> dict[str, str]:
+    """Parse sympy `bin/test --verbose` output into {`file.py::test_name`: status},
+    tracking the per-file header so names are unique and file-addressable. Concatenated
+    `--split` shard logs parse correctly since each shard carries its own file headers."""
+    out: dict[str, str] = {}
+    cur = None
+    for line in log.splitlines():
+        s = line.strip()
+        mf = _SYMPY_FILE_RE.match(s)
+        if mf:
+            cur = mf.group(1)
+            continue
+        mr = _SYMPY_RESULT_RE.match(s)
+        if mr and cur:
+            v = mr.group(2)
+            out[f"{cur}::{mr.group(1)}"] = (
+                TestStatus.PASSED.value if v == "ok"
+                else TestStatus.SKIPPED.value if v in ("s", "Skipped")
+                else TestStatus.FAILED.value)
+    return out
+
 # The SWE-bench-Verified repos whose test_cmd is pytest-based (directly, or via tox's
 # `--`). These get in-container `pytest -n N` parallelism using the pre-built `:xdist`
 # image (see build_xdist_images.py). django uses native `runtests.py --parallel`; sympy
@@ -123,16 +156,18 @@ def test_directives(repo: str, names: list[str]) -> list[str] | None:
     `repo`'s test_cmd, so `find_passing` names round-trip into a runnable `validate`
     selection across ALL SWE-bench(-Verified) repos.
 
-    Returns None when the repo's parser output cannot address individual tests at all;
-    the caller must then run the WHOLE suite and filter by re-parsing (correct, slower).
+    Returns None only if a repo's output truly cannot address tests; all 12 Verified repos
+    are addressable, so in practice this returns a (possibly file-granular) selector list.
 
     Audit of the 12 SWE-bench-Verified repos (parser -> emitted format -> runner arg):
       * django/django   parse_log_django   "method (dotted.module.Class)"  ->  runtests.py
         wants "dotted.module.Class.method". FLIP required (else the whole cmd errors out
         and every test is spuriously marked failed).
-      * sympy/sympy     parse_log_sympy    passing tests are BARE "test_func" (the file
-        path is lost by the parser) -> bin/test selects by file path / -k, so a bare
-        function name cannot address a specific test. NOT selectable -> whole-suite.
+      * sympy/sympy     parse_sympy_addressable  "file.py::test_name" (our file-aware
+        parser). Names round-trip unchanged; the sympy command builder runs the covering
+        files in-process with matches() patched to an EXACT name set (subprocess=False), so
+        selection is TEST-granular and slow tests co-located in a file are not executed.
+        Fixes the stock parser's bare, colliding, unrunnable names.
       * pylint / requests  parse_log_pytest_options truncates path-like "[/a/b/c]"
         parametrize ids to "[/c]", so the exact node id is unrecoverable. Drop the
         path-like param and select at function granularity (a safe superset; the
@@ -148,7 +183,12 @@ def test_directives(repo: str, names: list[str]) -> list[str] | None:
             out.append(f"{m['path']}.{m['method']}" if m else n)
         return out
     if repo == "sympy/sympy":
-        return None  # bare function names -> not addressable via bin/test
+        # Names are "file.py::test_name" (parse_sympy_addressable). Keep TEST granularity:
+        # return the exact names (deduped). bin/test's CLI can only select by FILE, but the
+        # sympy command builder runs the covering files in-process with matches() patched to
+        # an EXACT name set (subprocess=False), so slow tests co-located in the same file
+        # (e.g. test_integrals.py::test_issue_4737 among its 108 tests) are never executed.
+        return sorted(set(names))
     if repo in ("pylint-dev/pylint", "psf/requests"):
         # Strip a path-like "[/...]" param (the parser already mangled it) and select
         # the parametrized test at function level; dedupe while preserving order.
@@ -160,19 +200,20 @@ def test_directives(repo: str, names: list[str]) -> list[str] | None:
 SELECT_PROMPT = """You are selecting regression tests for a software issue.
 
 You are given a GitHub issue and a list of tests that currently PASS in the pristine
-repository. By default, a passing test should remain a regression test: a correct fix
-should not break existing behavior.
+repository. Select a REPRESENTATIVE subset of roughly {k} tests (about 10% of the
+list) to serve as the regression set: after a CORRECT fix for the issue, every
+selected test must still pass.
 
-Your job is to identify ONLY the tests whose expected behavior may legitimately change
-after a correct fix for this issue. These tests should be EXCLUDED from the regression
-set. Do NOT list tests merely because they seem unrelated, redundant, broad, or expensive;
-unrelated passing tests should still be kept as regression tests.
+Guidelines:
+- First include tests covering code the fix could plausibly touch (the same
+  module/subsystem the issue is about) — these are the likeliest to catch a bad fix.
+- Spread the remainder across DIFFERENT modules/files for breadth; prefer covering
+  many distinct files over many tests from the same file.
+- Do NOT select a test that appears to assert behavior the issue says is buggy,
+  obsolete, or intentionally changed by the fix (a correct fix legitimately changes
+  those).
 
-Exclude a test only if it appears to assert behavior that the issue says is buggy,
-obsolete, or intentionally changed by the fix.
-
-Return ONLY a JSON array of test names to EXCLUDE, each verbatim from the list below.
-Return [] if none of the passing tests should be excluded.
+Return ONLY a JSON array of test names to KEEP, each verbatim from the list below.
 
 ## Issue
 {issue}
@@ -305,7 +346,16 @@ class RegressionTester(BenchmarkEvaluation):
         return None
 
     def _run_tests(self, container, test_cmd: str, test_ids: list[str] | None,
-                   instance_id: str = "", phase: str = "test", wrap: bool = True) -> str:
+                   instance_id: str = "", phase: str = "test", wrap: bool = True,
+                   timeout: int | None = None) -> str:
+        to = self.test_timeout if timeout is None else timeout
+        # Pin PYTHONHASHSEED so find_passing and validate use the SAME hash ordering.
+        # validate is a differential re-run (does a test that passed in find_passing still
+        # pass?); hash-randomization-dependent tests (common in sympy's symbolic code) would
+        # otherwise flip pass<->fail between the two runs and show up as spurious failures.
+        # Exported once here, it propagates to all child workers (django --parallel, pytest
+        # -n xdist, sympy --split subprocesses), which then inherit it via `env`.
+        prefix = f"{self.eval_prefix} && export PYTHONHASHSEED=0"
         if wrap:
             ids = (" " + " ".join(test_ids)) if test_ids else ""
             # Wrap in `timeout` so a hanging test (e.g. requests network tests with no
@@ -314,12 +364,15 @@ class RegressionTester(BenchmarkEvaluation):
             # `env` so a test_cmd with a leading VAR=val (e.g. sympy's
             # "PYTHONWARNINGS='...' bin/test") works: without it `timeout` treats the
             # assignment as the program name and dies with rc 127 in <1s (0 passing).
-            cmd = f"{self.eval_prefix} && timeout {self.test_timeout} env {test_cmd}{ids}"
+            cmd = f"{prefix} && timeout {to} env {test_cmd}{ids}"
         else:
             # test_cmd is already a complete shell command (e.g. sympy's background
             # `--split` fan-out with its own per-process `timeout`/`env`). Run as-is so we
-            # don't double-wrap `env`/`timeout` around a compound command.
-            cmd = f"{self.eval_prefix} && {test_cmd}"
+            # don't double-wrap `env`/`timeout` around a compound command. Wrap it in a
+            # SUBSHELL so the leading `&&` gates the WHOLE compound: `prefix && (a; b & wait)`
+            # aborts everything if eval_prefix/cd fails, whereas `prefix && a; b` would gate
+            # only `a` and still run the rest in the wrong env/cwd (spurious all-fail).
+            cmd = f"{prefix} && ({test_cmd})"
         # Measure the test-suite run: wall-clock + container CPU-seconds (cgroup delta
         # around the exec). Excludes container startup (already running) and the
         # reset/apply done in separate exec calls — just this test run + its eval_prefix.
@@ -352,6 +405,13 @@ class RegressionTester(BenchmarkEvaluation):
             print(f"[regr] {instance_id}: failed to record test run: {e}")
 
     def _parse(self, repo: str, version: str, instance_id: str, log: str) -> dict[str, str]:
+        # sympy: use our file-aware parser so tests are uniquely named and addressable
+        # ("file.py::test_name") instead of the stock parser's bare, colliding names.
+        if repo == "sympy/sympy":
+            try:
+                return parse_sympy_addressable(log)
+            except Exception:
+                return {}
         parser = MAP_REPO_TO_PARSER[repo]
         stub = SimpleNamespace(repo=repo, version=version, instance_id=instance_id)
         try:
@@ -372,13 +432,14 @@ class RegressionTester(BenchmarkEvaluation):
 
     # --- unified parallelism (native-in-container, xdist baked in) -----------
 
-    # sympy is the only runner with neither native in-process parallelism nor id
-    # selection; it is parallelized by a few concurrent `bin/test --split` processes,
-    # each in its own container. Keep the fan-out small — a single Python process driving
-    # blocking exec_run streams stalls at high concurrency (GIL + docker + disk), so a
-    # big fan-out is both slow and wrong (stalled shards mark their tests failed).
-    _SYMPY_SPLIT_CAP = 8
-    _SHARD_CONCURRENCY_CAP = 8
+    # sympy has neither native in-process parallelism nor id selection. It IS parallelized
+    # by n concurrent `bin/test --split i/n` processes — but backgrounded INSIDE ONE
+    # container (shell `&` ... `wait`), NOT as n Python-driven containers. The core rule:
+    # concurrency lives container-side so the host's single Python process only ever drains
+    # ONE exec_run stream (each split writes its own /tmp log, cat'd at the end), which is
+    # why a high split count is fine here — unlike a Python-driven container fan-out, which
+    # stalls (GIL + docker + disk). Splits beyond the number of test files just run fewer
+    # (or zero) files each, which is harmless.
 
     @staticmethod
     def _inject_pytest_n(cmd: str, n: int) -> str:
@@ -387,71 +448,153 @@ class RegressionTester(BenchmarkEvaluation):
         the `:xdist` image is present); otherwise leave the cmd serial."""
         return f"{cmd} -n {n}" if n and n > 1 else cmd
 
-    def _shard_plan(self, repo: str, version: str, directives: list[str] | None,
-                    n: int, pytest_n: int) -> list[tuple[str, list[str] | None]]:
-        """Return the (cmd, ids) shards to run. The design goal is find_passing-style
-        NATIVE in-container parallelism (one container, the runner parallelizes inside),
-        which massively outperforms a many-container fan-out:
+    def _pytest_cmd(self, repo: str, version: str, pytest_n: int) -> str:
+        """Build the pytest command for a pytest repo with two speed flags that don't
+        change the `-rA` PASSED/FAILED lines the parser reads:
+          * `--tb=no`  — skip traceback formatting (we only need pass/fail).
+          * `-W ignore` — don't collect/aggregate the end-of-run warnings summary. On huge
+            suites this single-threaded pass DOMINATES the wall time after the parallel
+            workers finish (astropy: ~500s -> ~64s). It's self-consistent: find_passing and
+            validate use the SAME command, so any warning-filter effect cancels between the
+            two stages and never produces a spurious validate diff.
+        Then append `-n N` (xdist) when the `:xdist` image is present."""
+        cmd = self._test_cmd(repo, version) + " --tb=no -W ignore"
+        return self._inject_pytest_n(cmd, pytest_n)
 
-          * django  -> ONE container: `runtests.py --parallel n <labels>` (labels for
-            validate, none for find_passing). DB-cloning parallelism inside the container.
-          * pytest  -> ONE container: `pytest -n <pytest_n> <ids>` on the pre-built
-            `:xdist` image. pytest_n is n when xdist is available, else 1 (serial).
-          * sympy   -> no native parallelism and no id selection, so run a few
-            `bin/test --split i/k` shards, each in its own container (k capped).
+    # Fixed sympy test seed. sympy re-seeds Python's `random` module once per run with a
+    # FRESH random value (printed as "random seed: N"), which PYTHONHASHSEED does NOT
+    # control. Randomized numeric tests (evalf/heurisch/…) then flip pass<->fail between
+    # runs on different draws — so a test can pass find_passing under a lucky seed and fail
+    # validate under another (a spurious "regression" with no patch). Pinning the seed makes
+    # every run deterministic; the retry then decides regressions differentially (see
+    # `_retry_failures`) to also cancel run-ARRANGEMENT effects a fixed seed can't.
+    _SYMPY_SEED = 0
+
+    # In-process EXACT-match runner (validate/retry). `sys.argv[1:-1]` = files, `[-1]` =
+    # "i/k". matches() is patched to an exact name set (from $SYMPY_WANT) before any test is
+    # collected; subprocess=False keeps that patch in the process that actually runs the
+    # tests (sympy's default per-file subprocess would bypass a parent-process patch).
+    # verbose=True keeps the parser's "file[N]" + "name ok" lines; colors=False keeps them
+    # ANSI-free; seed=$SYMPY_SEED pins the per-test random draws. sympy's substring `-k`
+    # can't do the selection (it over-selects prefix siblings, and its CLI takes only ONE
+    # keyword); the Python API's per-function predicate can.
+    _SYMPY_EXACT = (
+        'import os,sys,sympy;'
+        'from sympy.utilities import runtests;'
+        '_w=set(os.environ["SYMPY_WANT"].split(","));'
+        'runtests.SymPyTests.matches=(lambda self,x: x.__name__ in _w);'
+        'raise SystemExit(0 if sympy.test(*sys.argv[1:-1], split=sys.argv[-1],'
+        ' subprocess=False, verbose=True, colors=False,'
+        ' seed=int(os.environ["SYMPY_SEED"])) else 1)'
+    )
+
+    def _sympy_split_loop(self, version: str, k: int,
+                          directives: list[str] | None = None,
+                          timeout: int | None = None) -> str:
+        """A single shell command that runs k `--split i/k` shards in the BACKGROUND
+        (concurrency container-side), waits, then cats every shard's log so the parser sees
+        the union. Each shard carries its own `timeout … env` (wrap=False in `_run_tests`).
+
+          * directives is None (find_passing): whole-suite `bin/test -C --verbose --split`.
+          * directives are "file.py::test_name" (validate/retry): run the unique covering
+            FILES via `python -c` with matches() patched to the EXACT name set, so slow
+            tests co-located in those files are never executed. `-C`'s no-cache is
+            reproduced with SYMPY_USE_CACHE=no so find_passing and validate stay consistent.
+        Both branches pin `--seed`/`seed=` to _SYMPY_SEED for deterministic runs.
         """
+        to = self.test_timeout if timeout is None else timeout
+        base = self._test_cmd("sympy/sympy", version)
+        if directives:
+            env_prefix = base.split("bin/test", 1)[0].strip()  # PYTHONWARNINGS='…'
+            files = " ".join(sorted({d.split("::", 1)[0] for d in directives}))
+            want = ",".join(sorted({d.split("::", 1)[1]
+                                    for d in directives if "::" in d}))
+            launches = " ".join(
+                f"timeout {to} env {env_prefix} SYMPY_USE_CACHE=no SYMPY_WANT='{want}' "
+                f"SYMPY_SEED={self._SYMPY_SEED} "
+                f"python -c '{self._SYMPY_EXACT}' {files} {i + 1}/{k} "
+                f"> /tmp/sy_{i + 1}.log 2>&1 &"
+                for i in range(k)
+            )
+        else:
+            launches = " ".join(
+                f"timeout {to} env {base} --seed {self._SYMPY_SEED} --split {i + 1}/{k} "
+                f"> /tmp/sy_{i + 1}.log 2>&1 &"
+                for i in range(k)
+            )
+        return f"rm -f /tmp/sy_*.log; {launches} wait; cat /tmp/sy_*.log"
+
+    def _shard_plan(self, repo: str, version: str, directives: list[str] | None,
+                    n: int, pytest_n: int,
+                    timeout: int | None = None) -> list[tuple[str, list[str] | None, bool]]:
+        """Return (cmd, ids, wrap) shards. The design goal is find_passing-style NATIVE
+        in-container parallelism (one container, the runner parallelizes inside), which
+        massively outperforms a many-container fan-out. Every runner yields ONE shard:
+
+          * django  -> `runtests.py --parallel n <labels>` (DB-cloning parallelism inside).
+          * pytest  -> `pytest -n <pytest_n> <ids>` on the pre-built `:xdist` image
+            (pytest_n = n when xdist is available, else 1 = serial).
+          * sympy   -> one container running n backgrounded `--split i/n` shards
+            (concurrency container-side; wrap=False as the loop is a complete command).
+            directives, if given, are "file.py::test" names run at EXACT test granularity
+            (in-process matches() patch); None -> whole-suite `bin/test` (find_passing).
+
+        wrap=True means _run_tests adds the standard `timeout … env` + ids; wrap=False runs
+        the cmd as-is (sympy's loop already carries per-split timeout/env)."""
         n = max(1, n)
         if repo == "django/django":
-            return [(self._test_cmd(repo, version, parallel=n), directives)]
+            return [(self._test_cmd(repo, version, parallel=n), directives, True)]
         if repo in PYTEST_REPOS:
-            cmd = self._inject_pytest_n(self._test_cmd(repo, version), pytest_n)
-            return [(cmd, directives)]
-        if repo == "sympy/sympy" and directives is None and n > 1:
-            k = min(n, self._SYMPY_SPLIT_CAP)
-            base = self._test_cmd(repo, version)
-            return [(f"{base} --split {i + 1}/{k}", None) for i in range(k)]
-        # sympy at n<=1, or any unknown runner: one serial container.
-        return [(self._test_cmd(repo, version), directives)]
+            return [(self._pytest_cmd(repo, version, pytest_n), directives, True)]
+        if repo == "sympy/sympy":
+            # directives (if any) are "file.py::test_name" from test_directives; None ->
+            # whole suite. Always route through the split loop: its exact-match branch
+            # consumes the file::test directives, which bin/test's CLI can't take.
+            k = max(1, n)
+            if directives:
+                # `--split i/k` partitions the covering FILE list, so more shards than files
+                # just spawn extra `python -c 'import sympy…'` processes that collect ZERO
+                # tests. Cap k at the file count (whole-suite keeps k=n for the big suite).
+                k = min(k, len({d.split("::", 1)[0] for d in directives}))
+            return [(self._sympy_split_loop(version, max(1, k), directives, timeout),
+                     None, False)]
+        # any unknown runner: one plain run.
+        return [(self._test_cmd(repo, version), directives, True)]
 
     def _run_partitioned(self, repo: str, version: str, instance_id: str, phase: str,
                          directives: list[str] | None, patch_text: str | None,
-                         n: int) -> tuple[dict[str, str], bool]:
-        """Run the shard plan and merge the per-shard parsed statuses. django/pytest yield
-        ONE shard (native in-container parallelism); only sympy yields a small capped
-        fan-out. Returns (merged_status, apply_failed).
+                         n: int, timeout: int | None = None) -> tuple[dict[str, str], bool]:
+        """Run the shard plan and merge the per-shard parsed statuses. Every runner yields
+        exactly ONE shard now (parallelism is container-side: django --parallel, pytest
+        -n, sympy backgrounded --split), so this is a single container per call. Returns
+        (merged_status, apply_failed).
 
         Each shard runs in its own fresh container (already at base_commit, so no git
         reset — validate just applies the candidate patch)."""
+        import time
         pytest_n = n if self._has_xdist(instance_id, repo) else 1
-        shards = self._shard_plan(repo, version, directives, n, pytest_n)
+        shards = self._shard_plan(repo, version, directives, n, pytest_n, timeout)
         merged: dict[str, str] = {}
         apply_failed = False
-        lock = threading.Lock()
-
-        def _one(cmd: str, ids: list[str] | None):
-            nonlocal apply_failed
-            import time
+        # Every runner yields exactly one shard (parallelism is container-side: django
+        # --parallel, pytest -n, sympy backgrounded --split), so run the shard(s) in fresh
+        # containers sequentially and merge — no thread pool / lock needed.
+        for cmd, ids, wrap in shards:
             t0 = time.time()
             container = self._start_container(instance_id, repo)
             _record_container_setup(phase, instance_id, t0, time.time())
             try:
                 if patch_text is not None and not self._apply_patch(container, patch_text):
-                    with lock:
-                        apply_failed = True
-                    return
-                log = self._run_tests(container, cmd, ids, instance_id, phase)
-                status = self._parse(repo, version, instance_id, log)
-                with lock:
-                    merged.update(status)
+                    apply_failed = True
+                    continue
+                log = self._run_tests(container, cmd, ids, instance_id, phase, wrap=wrap,
+                                      timeout=timeout)
+                merged.update(self._parse(repo, version, instance_id, log))
             finally:
                 _td0 = time.time()
                 container.remove(force=True)
                 _record_container_setup(phase, instance_id, _td0, time.time(),
                                         kind="container_teardown")
-
-        workers = min(len(shards), self._SHARD_CONCURRENCY_CAP)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(lambda s: _one(*s), shards))
         return merged, apply_failed
 
     def find_passing_tests(self, repo, version, instance_id, instance) -> list[str]:
@@ -468,44 +611,61 @@ class RegressionTester(BenchmarkEvaluation):
         return [t for t, s in status.items() if s == TestStatus.PASSED.value]
 
     # Max passing-test names to put in ONE select prompt. The full list is processed in
-    # batches of this size (per-batch exclusions unioned), so a large suite (django's
+    # batches of this size (per-batch selections unioned), so a large suite (django's
     # ~11.5k passing tests) never overflows the model context in a single call. Sized
-    # well under a 128k-token window, leaving room for the issue text and a worst-case
-    # (echo-sized) exclusion output.
+    # well under a 128k-token window, leaving room for the issue text and the ~10%
+    # keep-list output.
     _LLM_BATCH = 2000
+    # Share of each batch the LLM is asked to keep (also the prompt's "{k}").
+    _SELECT_FRAC = 0.10
+    # Hard ceiling on the regression set: above this, a seeded sample brings it back
+    # down so validate's label-selection path always applies. Keyed on instance_id so
+    # every candidate of an instance validates against the SAME set.
+    _SAMPLE_CAP = 1000
 
     def select_regression_tests(self, issue: str, passing: list[str],
                                 instance_id: str = "") -> list[str]:
-        """Step 2: LLM names the few tests a correct fix may change; keep the rest.
+        """Step 2: LLM picks a ~10% REPRESENTATIVE subset of the passing tests.
 
-        Exclusion framing (ask for the drop-list, not the keep-list) so the LLM output
-        is tiny — normally empty — instead of re-emitting all N passing test names
-        verbatim (which is decode-bound slow and degenerates into a blind echo).
+        Selection framing (ask for a small keep-list): the regression set stays at
+        ~_SELECT_FRAC of the suite, so validate runs it by label selection instead of
+        re-running the whole suite per candidate. The old exclusion rule is folded into
+        the prompt: tests asserting the issue's buggy behavior must NOT be selected.
 
-        The passing list is processed in context-safe batches of _LLM_BATCH (the per-batch
-        exclusion sets are unioned), so an arbitrarily large suite is handled without
-        overflowing the model context or silently dropping tests."""
+        The passing list is processed in context-safe batches of _LLM_BATCH (per-batch
+        keep-lists unioned). A batch whose response is empty/garbage falls back to a
+        seeded random sample of that batch, so no region of the suite is silently
+        dropped. The union is capped at _SAMPLE_CAP by a seeded sample."""
         if not passing:
             return []
         shown = passing[: self.max_tests_for_llm]
         if len(passing) > self.max_tests_for_llm:
             print(f"[regr] {len(passing)} passing tests > cap {self.max_tests_for_llm}; "
                   f"considering the first {self.max_tests_for_llm}")
-        excluded: set[str] = set()
+        selected: list[str] = []
         turns = []
         for start in range(0, len(shown), self._LLM_BATCH):
             batch = shown[start:start + self._LLM_BATCH]
-            prompt = SELECT_PROMPT.format(issue=issue, tests="\n".join(batch))
+            k = max(1, round(len(batch) * self._SELECT_FRAC))
+            prompt = SELECT_PROMPT.format(issue=issue, k=k, tests="\n".join(batch))
             messages = [LLMMessage(role="user", content=prompt)]
             resp = self.llm_client.chat(messages, self.model_config, None, reuse_history=False)
             turns.append((messages, resp))
             batch_set = set(batch)
-            # Only honour exclusions that name a real test in THIS batch.
-            excluded |= {t for t in self._extract_json_list(resp.content) if t in batch_set}
+            # Only honour selections that name a real test in THIS batch (dedup, keep order).
+            picked = [t for t in dict.fromkeys(self._extract_json_list(resp.content))
+                      if t in batch_set]
+            if not picked:
+                picked = random.Random(f"{instance_id}:{start}").sample(batch, k)
+                print(f"[regr] {instance_id}: batch@{start} returned no usable selection; "
+                      f"falling back to a seeded {k}-test sample")
+            selected.extend(picked)
         self._record_turns(instance_id, turns)
-        # Everything shown except the few legitimately-changeable tests. Empty/garbage
-        # responses -> exclude nothing -> keep all (the paper's conservative default).
-        return [t for t in shown if t not in excluded]
+        if len(selected) > self._SAMPLE_CAP:
+            print(f"[regr] {instance_id}: {len(selected)} selected > cap "
+                  f"{self._SAMPLE_CAP}; sampling down")
+            selected = random.Random(instance_id).sample(selected, self._SAMPLE_CAP)
+        return selected
 
     def _record_turns(self, instance_id: str, turns) -> None:
         """Record the regression LLM call(s) as turns in `llm_interactions[]`, matching
@@ -547,23 +707,181 @@ class RegressionTester(BenchmarkEvaluation):
         except json.JSONDecodeError:
             return []
 
+    # Above this many regression tests, don't pass them as a CLI label list — run the
+    # whole suite and filter instead. select_regression_tests already samples the set
+    # down to _SAMPLE_CAP, so this now matches it as a pure safety net (label lists of
+    # this size are still far below ARG_MAX); only unaddressable names force the
+    # whole-suite path in practice.
+    _VALIDATE_LABEL_CAP = 1000
+
+    @staticmethod
+    def _num_addressable(repo: str, names: list[str]) -> int:
+        """How many names can be turned into a valid CLI selector for `repo` (django needs
+        the "method (module.Class)" shape — its parser also emits pseudo-entries like
+        "--version is equivalent to version" that are NOT valid labels; pytest node ids and
+        sympy "file.py::test" names are all addressable — sympy at test granularity)."""
+        if repo == "django/django":
+            return sum(1 for n in names if _DJANGO_NAME_RE.match(n.strip()))
+        return len(names)
+
     def validate_candidate(self, repo, version, instance_id, regression_tests,
                            patch_text) -> list[str]:
-        """Step 3: failed regression tests for one candidate patch (sharded)."""
+        """Step 3: failed regression tests for one candidate patch.
+
+        Runs by label-selection (only the chosen tests) when the set is small AND every
+        name is addressable; otherwise runs the WHOLE suite and filters by re-parsing.
+        Whole-suite is mandatory when a name can't be addressed — e.g. sympy's bare names,
+        or a django parser pseudo-entry ("--version is equivalent to version"): one such
+        token as a label aborts the entire runtests invocation, yielding zero results and
+        spuriously failing every candidate. It is also no more expensive than selection
+        once the regression set approaches the whole suite (the uncapped case)."""
         if not regression_tests:
             return []
-        # Adapt parser-emitted names into runnable CLI selectors. None -> the repo can't
-        # address individual tests (sympy's bare names); the shard plan then runs the
-        # whole suite (via --split) and we filter by re-parsing.
         directives = test_directives(repo, regression_tests)
+        whole_suite = (
+            directives is None
+            or self._num_addressable(repo, regression_tests) < len(regression_tests)
+            or len(regression_tests) > self._VALIDATE_LABEL_CAP
+        )
         status, apply_failed = self._run_partitioned(
             repo, version, instance_id, "validate",
-            directives=directives, patch_text=patch_text, n=self.test_parallel or 1)
+            directives=None if whole_suite else directives,
+            patch_text=patch_text, n=self.test_parallel or 1)
         if apply_failed:
             # Unappliable patch -> treat as failing everything (will be pruned).
             return list(regression_tests)
         # A regression test must PASS; anything else (fail/error/missing) is a failure.
-        return [t for t in regression_tests if status.get(t) != TestStatus.PASSED.value]
+        # Whole-suite re-parses every test (artifacts re-emitted as PASSED, exactly as
+        # find_passing saw them), so a missing status genuinely means not-passed.
+        failed = [t for t in regression_tests if status.get(t) != TestStatus.PASSED.value]
+        # Strip flaky-under-load noise: re-run a MODEST failure set at LOW parallelism once
+        # (see _retry_failures). A test that passes with little parallel contention was a
+        # timing/port/state/order flake, not a real regression. A huge failure set is real
+        # breakage (the patch), so skip it.
+        if 0 < len(failed) <= self._RETRY_CAP:
+            failed = self._retry_failures(repo, version, instance_id, failed, patch_text)
+        return failed
+
+    _RETRY_CAP = 100
+    # Retry at LOW (not zero) parallelism. The flakiness came from extreme 96-way
+    # contention; a small degree leaves each test ample headroom (so it still un-flakes)
+    # while being ~N faster than serial — important for sympy, whose retry re-runs whole
+    # slow FILES (e.g. test_integrals.py), which serial would drag out. Scale the retry
+    # degree as a fixed 1/8 fraction of the main parallelism (not a hard-coded count) so it
+    # tracks the configured `test_parallel` — 96 -> 12, 8 -> 1 — with a floor of 1.
+    _RETRY_DIVISOR = 8
+
+    def _retry_failures(self, repo, version, instance_id, failed, patch_text) -> list[str]:
+        """Re-run the failed tests at LOW parallelism (no meaningful contention) once, and
+        keep only those that STILL don't pass. Distinguishes genuine regressions (fail even
+        with headroom) from flaky-under-load tests (pass once the 96-way contention is
+        gone)."""
+        # sympy: its "failures" are RecursionErrors from CROSS-TEST STATE POLLUTION in a
+        # shared bin/test process (verified: every such test passes when run alone). A
+        # low-parallelism re-run of the whole FILE still reproduces the pollution, so retry
+        # each failed test in its OWN fresh process instead (see below).
+        if repo == "sympy/sympy":
+            return self._retry_sympy_isolated(instance_id, failed, patch_text)
+        directives = test_directives(repo, failed)
+        if not directives:
+            return failed  # nothing addressable to re-run
+        # Same addressability guard as validate_candidate: if any name can't be turned into a
+        # valid CLI label (e.g. a django parser pseudo-entry like "--version is equivalent to
+        # version"), passing it as a runtests label aborts the ENTIRE invocation, so the retry
+        # would parse zero results and spuriously keep every test failed. Fall back to the
+        # whole suite + re-parse filter, exactly as validate does.
+        whole_suite = self._num_addressable(repo, failed) < len(failed)
+        n = max(1, (self.test_parallel or 1) // self._RETRY_DIVISOR)
+        # No time limit on the retry (`timeout 0` = unlimited): the failure set is small and
+        # low-parallelism, so it must run to completion to give a definitive verdict. A cap
+        # here would re-introduce the very timeout-boundary flakiness the retry exists to
+        # remove (a co-located slow file eats the budget before the flaky test is reached).
+        status, apply_failed = self._run_partitioned(
+            repo, version, instance_id, "retry",
+            directives=None if whole_suite else directives,
+            patch_text=patch_text, n=n, timeout=0)
+        if apply_failed:
+            return failed
+        return [t for t in failed if status.get(t) != TestStatus.PASSED.value]
+
+    _baseline_lock = threading.Lock()
+
+    def _retry_sympy_isolated(self, instance_id, failed, patch_text) -> list[str]:
+        """Decide sympy regressions DIFFERENTIALLY under a per-test-isolated, fixed-seed
+        re-run: a test is a regression iff it FAILS with the patch but PASSES on the pristine
+        repo, both isolated. This cancels the three things that otherwise make a test fail
+        validate with NO patch to blame:
+          (a) run-to-run flakiness — sympy re-seeds `random` freshly each run, so pin it;
+          (b) cross-test global-state pollution — give each test its own fresh interpreter;
+          (c) find_passing's whole-suite PASS disagreeing with an isolated re-run on the
+              PRISTINE code (a test that only passes in a lucky suite arrangement, e.g.
+              test_heurisch::test_issue_3609). Such a test fails the pristine baseline too,
+              so the differential drops it instead of blaming the patch."""
+        patched = self._sympy_isolated_status(instance_id, failed, patch_text)
+        if patched is None:
+            return failed  # patch didn't apply -> conservatively fail all (will be pruned)
+        # A regression can only survive if it FAILS under the patch, so only those need a
+        # pristine baseline; tests that un-flaked under the patch (the common case) are
+        # dropped regardless of pristine, so skip computing it for them (and skip the
+        # pristine container entirely when nothing is still failing).
+        still_failing = [t for t in failed if not patched.get(t, False)]
+        if not still_failing:
+            return []
+        pristine = self._sympy_pristine_isolated(instance_id, still_failing)
+        return [t for t in still_failing if pristine.get(t, False)]
+
+    def _sympy_isolated_status(self, instance_id, tests, patch_text) -> dict | None:
+        """Run each sympy test in its OWN fresh interpreter with seed pinned, returning
+        {test: passed_bool}. The fresh process removes cross-test state pollution; the pinned
+        seed (+ inherited PYTHONHASHSEED=0) removes randomized-test flakiness. Reuses the
+        shared `_SYMPY_EXACT` runner with a one-element want set and `--split 1/1` (a single
+        file, un-split). Returns None if the patch does not apply."""
+        container = self._start_container(instance_id, "sympy/sympy")
+        try:
+            if patch_text is not None and not self._apply_patch(container, patch_text):
+                return None
+            # Each test in its own interpreter (isolation is the point), but run up to `par`
+            # at a time instead of strictly serial — a large failure set would otherwise cost
+            # len(tests) * up-to-300s. Bounded container-side concurrency (background each,
+            # `wait` every `par` jobs), mirroring _sympy_split_loop; par tracks test_parallel.
+            par = max(1, (self.test_parallel or 1) // self._RETRY_DIVISOR)
+            parts = []
+            for idx, name in enumerate(tests):
+                file, _, func = name.partition("::")
+                # Own interpreter per test; generous per-test timeout guards a hang.
+                job = (
+                    f"if timeout 300 env SYMPY_USE_CACHE=no SYMPY_WANT='{func}' "
+                    f"SYMPY_SEED={self._SYMPY_SEED} python -c '{self._SYMPY_EXACT}' {file} 1/1 "
+                    f'>/dev/null 2>&1; then echo "RPASS::{name}"; else echo "RFAIL::{name}"; fi')
+                parts.append(f"{{ {job} ; }} &")
+                if (idx + 1) % par == 0:
+                    parts.append("wait")
+            parts.append("wait")
+            # Newline-join: `{ …; } &` and a bare `wait` need a real command separator
+            # between them — a space gives `wait { …` which bash rejects (`wait` is a simple
+            # command, so `{` is a literal arg, not a group). Newlines separate cleanly.
+            out = self._run_tests(container, "\n".join(parts), None, instance_id, "retry",
+                                  wrap=False, timeout=0)
+            passed = {l[len("RPASS::"):] for l in out.splitlines() if l.startswith("RPASS::")}
+            return {t: (t in passed) for t in tests}
+        finally:
+            container.remove(force=True)
+
+    def _sympy_pristine_isolated(self, instance_id, tests) -> dict:
+        """Pristine {test: passed_bool} under the isolated fixed-seed method, cached per
+        instance (patch-independent, so it is reused across every candidate)."""
+        with self._baseline_lock:
+            if not hasattr(self, "_baseline_cache"):
+                self._baseline_cache = {}
+            cache = self._baseline_cache.setdefault(instance_id, {})
+            todo = [t for t in tests if t not in cache]
+        if todo:
+            res = self._sympy_isolated_status(instance_id, todo, None) or {}
+            with self._baseline_lock:
+                for t in todo:
+                    cache[t] = res.get(t, False)
+        with self._baseline_lock:
+            return {t: cache[t] for t in tests}
 
     def process_instance(self, entry: dict) -> dict:
         instance_id = entry["instance_id"]

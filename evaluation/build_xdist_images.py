@@ -67,13 +67,16 @@ def build_one(client, instance_id: str, rebuild: bool) -> tuple[str, str]:
         except Exception:
             pass
     try:
-        client.images.get(base)
+        base_img = client.images.get(base)
     except Exception:
         return instance_id, "skip-no-base-image"
 
     # Override the image ENTRYPOINT with a keepalive — some images (e.g. requests) ship a
     # custom entrypoint that runs a setup script and exits, which would kill the container
-    # before we can install into it. `tail -f /dev/null` keeps any image alive.
+    # before we can install into it. `tail -f /dev/null` keeps any image alive. We RESTORE
+    # the base image's Entrypoint/Cmd on commit (below) so the `:xdist` image behaves like
+    # the base for a normal `docker run` (else it inherits the tail keepalive).
+    base_cfg = base_img.attrs.get("Config", {}) or {}
     container = client.containers.run(base, entrypoint=["tail", "-f", "/dev/null"],
                                       detach=True)
     try:
@@ -98,7 +101,14 @@ def build_one(client, instance_id: str, rebuild: bool) -> tuple[str, str]:
         if "numprocesses" not in opt:
             return instance_id, "skip-n-flag-missing"
 
-        container.commit(repository=repo, tag="xdist")
+        # Restore the base image's entrypoint/cmd (undo the tail keepalive override) so the
+        # committed image runs normally under `docker run`. Pass [] (not None) when the base
+        # has no Entrypoint/Cmd: docker's commit MERGES conf over the container config and
+        # IGNORES null fields, so None would leave the `tail -f /dev/null` keepalive in the
+        # committed image (verified). An empty list explicitly clears it back to the base's.
+        container.commit(repository=repo, tag="xdist",
+                         conf={"Entrypoint": base_cfg.get("Entrypoint") or [],
+                               "Cmd": base_cfg.get("Cmd") or []})
         return instance_id, "built"
     except Exception as e:  # noqa: BLE001 - report and continue with the rest
         return instance_id, f"error:{type(e).__name__}"
