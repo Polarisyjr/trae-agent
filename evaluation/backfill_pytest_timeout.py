@@ -1,16 +1,22 @@
 # Copyright (c) 2025 ByteDance Ltd. and/or its affiliates
 # SPDX-License-Identifier: MIT
 
-"""Backfill `pytest-timeout` into EXISTING `<repo>:xdist` images.
+"""Backfill `pytest-timeout` AND the `regr_stream` plugin into EXISTING `<repo>:xdist`
+images.
 
-The regression tester's per-test `--timeout` (regression.per_test_timeout) is only
-passed for instances whose `:xdist` image is present — and it needs the pytest-timeout
-plugin installed there. `build_xdist_images.py` now installs it alongside xdist, but the
-~194 already-built `:xdist` images predate that and would fail pytest with
-'unrecognized arguments: --timeout'. This does the minimal incremental install (no xdist
-rebuild): for each existing `:xdist` image, pip install pytest-timeout and commit back to
-the SAME tag, preserving its entrypoint/cmd. Idempotent — images that already import
-pytest_timeout are left untouched.
+Both ride the same "an `:xdist` image is fully provisioned" contract that the regression
+tester assumes (it gates `--timeout` / `-p regr_stream` on the xdist image's mere
+presence, not a per-run check):
+  * pytest-timeout — backs the per-test `--timeout` (regression.per_test_timeout).
+  * regr_stream    — streams per-test "<STATUS> <nodeid>" lines so a SIGKILLed whole-suite
+                     find_passing keeps the tests that passed before the kill (loaded via
+                     `-p regr_stream`; see regr_stream_plugin.py).
+`build_xdist_images.py` now bakes BOTH into fresh images, but the ~194 already-built
+`:xdist` images predate them and would fail pytest with 'unrecognized arguments: --timeout'
+or 'no module named regr_stream'. This does the minimal incremental install (no xdist
+rebuild): for each existing `:xdist` image, install whichever of the two is missing and
+commit back to the SAME tag, preserving its entrypoint/cmd. Idempotent — images that
+already have both are left untouched.
 
     uv run python -m evaluation.backfill_pytest_timeout            # all local :xdist images
     uv run python -m evaluation.backfill_pytest_timeout --instances astropy__astropy-14995
@@ -22,6 +28,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docker import from_env
 from tqdm import tqdm
+
+from .regr_stream_plugin import install_regr_stream
 
 EVAL_PREFIX = "source /opt/miniconda3/bin/activate testbed"
 
@@ -52,20 +60,28 @@ def backfill_one(client, xdist_tag: str) -> tuple[str, str]:
     container = client.containers.run(xdist_tag, entrypoint=["tail", "-f", "/dev/null"],
                                       detach=True)
     try:
-        rc_have, _ = _exec(container, "python -c 'import pytest_timeout' 2>/dev/null")
-        if rc_have == 0:
+        need_timeout = _exec(container, "python -c 'import pytest_timeout' 2>/dev/null")[0] != 0
+        need_stream = _exec(container, "python -c 'import regr_stream' 2>/dev/null")[0] != 0
+        if not need_timeout and not need_stream:
             return xdist_tag, "already-present"
-        rc, out = _exec(container, "pip install -q pytest-timeout")
-        if rc != 0:
-            return xdist_tag, f"install-failed:{out.strip().splitlines()[-1][:80] if out.strip() else ''}"
-        rc_imp, _ = _exec(container, "python -c 'import pytest_timeout'")
-        if rc_imp != 0:
-            return xdist_tag, "import-failed"
+        did = []
+        if need_timeout:
+            rc, out = _exec(container, "pip install -q pytest-timeout")
+            if rc != 0:
+                return xdist_tag, f"install-failed:{out.strip().splitlines()[-1][:80] if out.strip() else ''}"
+            if _exec(container, "python -c 'import pytest_timeout'")[0] != 0:
+                return xdist_tag, "import-failed"
+            did.append("timeout")
+        if need_stream:
+            ok, msg = install_regr_stream(lambda c: _exec(container, c))
+            if not ok:
+                return xdist_tag, f"regr-stream-{msg}"
+            did.append("regr_stream")
         repo = xdist_tag.rsplit(":", 1)[0]
         container.commit(repository=repo, tag="xdist",
                          conf={"Entrypoint": cfg.get("Entrypoint") or [],
                                "Cmd": cfg.get("Cmd") or []})
-        return xdist_tag, "backfilled"
+        return xdist_tag, "backfilled:" + "+".join(did)
     except Exception as e:  # noqa: BLE001
         return xdist_tag, f"error:{type(e).__name__}"
     finally:

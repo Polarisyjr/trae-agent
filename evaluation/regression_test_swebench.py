@@ -580,10 +580,21 @@ class RegressionTester(BenchmarkEvaluation):
         cap is set, append `--timeout=N --timeout-method=signal`: signal (SIGALRM, main
         thread) fails the ONE slow test and lets the run continue, unlike the `thread`
         method which kills the whole worker. Gated on the plugin's presence — passing
-        `--timeout` to a pytest without it aborts the run with 'unrecognized arguments'."""
+        `--timeout` to a pytest without it aborts the run with 'unrecognized arguments'.
+
+        Also load `-p regr_stream` on the `:xdist` image (baked in alongside xdist/timeout;
+        see regr_stream_plugin.py). It streams each test's "<STATUS> <nodeid>" line as the
+        test completes, so a whole-suite find_passing that is SIGKILLed on its wall-clock
+        `timeout` (heavy suites like scikit-learn) still yields the tests that passed BEFORE
+        the kill — the `-rA` summary the parser reads is emitted only at the end and is
+        otherwise lost, zeroing the passing set (and silently the whole prune). Same
+        image-provisioning contract as `--timeout`: `-p` on an image lacking the module
+        would abort, so it rides the `:xdist` gate and the backfill provisions old images."""
         cmd = self._test_cmd(repo, version) + " --tb=no -W ignore"
-        if has_timeout and self.per_test_timeout > 0:
-            cmd += f" --timeout={self.per_test_timeout} --timeout-method=signal"
+        if has_timeout:
+            cmd += " -p regr_stream"
+            if self.per_test_timeout > 0:
+                cmd += f" --timeout={self.per_test_timeout} --timeout-method=signal"
         return self._inject_pytest_n(cmd, pytest_n)
 
     # Fixed sympy test seed. sympy re-seeds Python's `random` module once per run with a

@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from docker import from_env
 from tqdm import tqdm
 
+from .regr_stream_plugin import install_regr_stream
 from .regression_test_swebench import PYTEST_REPOS
 
 EVAL_PREFIX = "source /opt/miniconda3/bin/activate testbed"
@@ -106,6 +107,14 @@ def build_one(client, instance_id: str, rebuild: bool) -> tuple[str, str]:
             return instance_id, "skip-pytest-timeout-import-failed"
         if "numprocesses" not in opt:
             return instance_id, "skip-n-flag-missing"
+
+        # Bake the regr_stream plugin (streams per-test results so a SIGKILLed find_passing
+        # keeps its partial passes; loaded via `-p regr_stream`). Baked here so every fresh
+        # `:xdist` image carries it under the same "xdist image is fully provisioned"
+        # contract as xdist/pytest-timeout.
+        ok, msg = install_regr_stream(lambda c: _exec(container, c))
+        if not ok:
+            return instance_id, f"skip-regr-stream-{msg}"
 
         # Restore the base image's entrypoint/cmd (undo the tail keepalive override) so the
         # committed image runs normally under `docker run`. Pass [] (not None) when the base
