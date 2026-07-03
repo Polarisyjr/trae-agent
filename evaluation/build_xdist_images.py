@@ -85,19 +85,25 @@ def build_one(client, instance_id: str, rebuild: bool) -> tuple[str, str]:
         if not before:
             return instance_id, "skip-no-pytest"
 
-        # Pin pytest so xdist resolves a compatible version and can never upgrade it.
-        rc, out = _exec(container, f'pip install -q pytest-xdist "pytest=={before}"')
+        # Pin pytest so xdist/timeout resolve a compatible version and can never upgrade it.
+        # pytest-timeout ships alongside xdist so the runtime per-test `--timeout` (gated on
+        # the `:xdist` image being present) is always backed by the plugin.
+        rc, out = _exec(container,
+                        f'pip install -q pytest-xdist pytest-timeout "pytest=={before}"')
         if rc != 0:
             return instance_id, "skip-install-failed"
 
         rc, ver2 = _exec(container, "python -c 'import pytest; print(pytest.__version__)'")
         after = ver2.strip().splitlines()[-1] if rc == 0 else ""
         rc_imp, _ = _exec(container, "python -c 'import xdist'")
+        rc_to, _ = _exec(container, "python -c 'import pytest_timeout'")
         rc_opt, opt = _exec(container, 'pytest -h 2>&1 | grep -- "-n numprocesses" || true')
         if after != before:
             return instance_id, f"skip-pytest-changed({before}->{after})"
         if rc_imp != 0:
             return instance_id, "skip-xdist-import-failed"
+        if rc_to != 0:
+            return instance_id, "skip-pytest-timeout-import-failed"
         if "numprocesses" not in opt:
             return instance_id, "skip-n-flag-missing"
 
