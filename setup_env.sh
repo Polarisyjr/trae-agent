@@ -21,12 +21,10 @@
 #   bash frameworks/trae-agent/setup_env.sh             # full setup
 #   bash frameworks/trae-agent/setup_env.sh --verify    # skip install, just check
 #
-# Known gotcha when actually RUNNING the pipeline (not a setup_env.sh concern,
-# noted here so it isn't rediscovered): `~/.bash_profile` sets
-# HF_HOME=/mnt/azureuser/huggingface, which is not writable by this user and
-# shadows ~/.bashrc's HF_HOME=/mnt/raid0/jirong/hf (where the models actually
-# are). Export HF_HOME=/mnt/raid0/jirong/hf explicitly when invoking
-# scripts/trae/start.sh / run_pipeline.py.
+# Known gotcha when actually RUNNING the pipeline (not a setup_env.sh concern):
+# keep HF_HOME/HF_HUB_CACHE on a writable local path for this user. The pz
+# default is /mnt/raid0/pz/hf, and scripts/trae/start.sh forwards the caller's
+# HF_* values into its tmux login shell.
 
 set -euo pipefail
 
@@ -50,6 +48,9 @@ if [ "$VERIFY_ONLY" = "0" ]; then
 
     say "2. uv sync --all-extras (creates .venv)"
     ( cd "$TRAE_DIR" && uv sync --all-extras )
+    # swebench currently permits chardet 7.x, which makes requests warn on
+    # every import. Keep it in requests' supported range for clean logs.
+    ( cd "$TRAE_DIR" && uv pip install 'chardet<6' )
     ok ".venv ready"
 fi
 
