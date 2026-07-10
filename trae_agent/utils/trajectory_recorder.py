@@ -81,6 +81,7 @@ class TrajectoryRecorder:
         provider: str,
         model: str,
         tools: list[Any] | None = None,
+        latency_s: float | None = None,
     ) -> None:
         """Record an LLM interaction.
 
@@ -90,9 +91,11 @@ class TrajectoryRecorder:
             provider: LLM provider used
             model: Model used
             tools: Tools available during the interaction
+            latency_s: Text-to-text wall time of the LLM HTTP round trip, if measured
         """
         interaction = {
             "timestamp": datetime.now().isoformat(),
+            "latency_s": latency_s,
             "provider": provider,
             "model": model,
             "input_messages": [self._serialize_message(msg) for msg in messages],

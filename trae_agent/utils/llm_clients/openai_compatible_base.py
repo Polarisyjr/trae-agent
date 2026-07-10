@@ -4,6 +4,7 @@
 """Base class for OpenAI-compatible clients with shared logic."""
 
 import json
+import time
 from abc import ABC, abstractmethod
 from typing import override
 
@@ -91,7 +92,8 @@ class OpenAICompatibleClient(BaseLLMClient):
         else:
             token_params["max_tokens"] = model_config.get_max_tokens_param()
 
-        return self.client.chat.completions.create(
+        t0 = time.monotonic()
+        response = self.client.chat.completions.create(
             model=model_config.model,
             messages=self.message_history,
             tools=tool_schemas if tool_schemas else openai.NOT_GIVEN,
@@ -105,6 +107,8 @@ class OpenAICompatibleClient(BaseLLMClient):
             n=1,
             **token_params,
         )
+        self._last_t2t_s = time.monotonic() - t0  # text-to-text wall of this HTTP round trip
+        return response
 
     @override
     def chat(
@@ -210,6 +214,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                 provider=self.provider_config.get_provider_name(),
                 model=model_config.model,
                 tools=tools,
+                latency_s=getattr(self, "_last_t2t_s", None),
             )
 
         return llm_response
