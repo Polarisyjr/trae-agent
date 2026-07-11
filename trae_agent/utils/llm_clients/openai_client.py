@@ -46,7 +46,7 @@ class OpenAIClient(BaseLLMClient):
         self.message_history: ResponseInputParam = []
 
     def _capture_replay_request(self, request: httpx.Request) -> None:
-        if self.trajectory_recorder is None or not request.url.path.endswith("/responses"):
+        if not request.url.path.endswith("/responses"):
             return
         try:
             body = json.loads(request.content)

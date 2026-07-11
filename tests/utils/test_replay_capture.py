@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
+
 from trae_agent.tools.base import ToolResult
 from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.utils.llm_clients.openai_client import OpenAIClient
 from trae_agent.utils.trajectory_recorder import TrajectoryRecorder
 
 
@@ -60,3 +63,22 @@ def test_trajectory_recorder_preserves_replay_request_and_tool_execution(
     assert result["executed_command"] == "printf ok"
     assert result["exit_code"] == 0
     assert result["started_at_ns"] == 210
+
+
+def test_openai_wire_capture_does_not_require_attached_recorder() -> None:
+    client = OpenAIClient.__new__(OpenAIClient)
+    client._replay_http_attempts = []
+    request = httpx.Request(
+        "POST",
+        "http://localhost:8000/v1/responses",
+        content=json.dumps({"model": "model", "input": "hello"}).encode(),
+    )
+    client._capture_replay_request(request)
+    response = httpx.Response(200, request=request, content=b'{}')
+    client._capture_replay_response(response)
+    assert client._replay_http_attempts[0]["body"] == {
+        "model": "model",
+        "input": "hello",
+    }
+    assert client._replay_http_attempts[0]["status_code"] == 200
+    assert client._replay_http_attempts[0]["ended_at_ns"] is not None
