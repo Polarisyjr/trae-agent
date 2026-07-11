@@ -1,5 +1,6 @@
 import re
 import shlex
+import time
 
 from trae_agent.tools import tools_registry
 from trae_agent.tools.base import Tool, ToolResult
@@ -125,8 +126,16 @@ def parse_tool_response(answer: LLMResponse, finish_reason: str, sandbox_session
 
             cmd += " > /home/swe-bench/tools/log.out 2>&1"
             print(repr(cmd))
-            _ = sandbox_session.execute(cmd)
+            exit_path = "/home/swe-bench/tools/exit.code"
+            started_at_ns = time.time_ns()
+            _ = sandbox_session.execute(f"{cmd}; printf '%s' $? > {exit_path}")
             sandbox_res = sandbox_session.execute("cat /home/swe-bench/tools/log.out")
+            exit_text = sandbox_session.execute(f"cat {exit_path}")
+            ended_at_ns = time.time_ns()
+            exit_codes = re.findall(r"(?m)^\s*([0-9]+)\s*$", exit_text)
+            if not exit_codes:
+                raise RuntimeError(f"selector tool exit code was not captured: {exit_text!r}")
+            exit_code = int(exit_codes[-1])
             status = ""
             status_line_index = -1
             sandbox_res_str_list = sandbox_res.split("\n")
@@ -148,6 +157,15 @@ def parse_tool_response(answer: LLMResponse, finish_reason: str, sandbox_session
                     success=status != "Tool Call Status: -1",
                     result=res_content,
                     error=None if status != "Tool Call Status: -1" else res_content,
+                    exit_code=exit_code,
+                    executed_command=(
+                        f"{cmd}; rc=$?; printf '%s' \"$rc\" > {exit_path}; "
+                        f"cat /home/swe-bench/tools/log.out; cat {exit_path} >/dev/null; "
+                        'exit "$rc"'
+                    ),
+                    executor="docker",
+                    started_at_ns=started_at_ns,
+                    ended_at_ns=ended_at_ns,
                 ),
             )
             result.append(tool_message)

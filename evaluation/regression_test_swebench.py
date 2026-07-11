@@ -58,6 +58,7 @@ SWE-bench only (the standard / most common setting). Run from the repo root:
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -422,9 +423,10 @@ class RegressionTester(BenchmarkEvaluation):
         v2 += glob.glob(f"/sys/fs/cgroup/**/docker-{cid}.scope/cpu.stat", recursive=True)
         for path in v2:
             try:
-                for line in open(path):
-                    if line.startswith("usage_usec"):
-                        return int(line.split()[1])
+                with open(path) as handle:
+                    for line in handle:
+                        if line.startswith("usage_usec"):
+                            return int(line.split()[1])
             except OSError:
                 continue
         # cgroup v1: cpuacct.usage (nanoseconds) -> microseconds
@@ -483,7 +485,10 @@ class RegressionTester(BenchmarkEvaluation):
         rc, out = self._bash(container, cmd)
         t1 = time.time()
         c1 = self._container_cpu_usec(container)
-        self._record_test_run(instance_id, phase, t0, t1, c0, c1, test_ids)
+        self._record_test_run(
+            instance_id, phase, t0, t1, c0, c1, test_ids, cmd, rc, out,
+            container.image.id, (container.image.tags or [container.image.id])[0],
+        )
         # docker exec returns rc 255 with an "exec …" diagnostic when bash itself could
         # not start — most importantly "argument list too long" (E2BIG) when the command
         # string exceeds the kernel's MAX_ARG_STRLEN (~128 KB). The framework never ran,
@@ -495,7 +500,10 @@ class RegressionTester(BenchmarkEvaluation):
                 f"cmd={len(cmd)} bytes): {out.strip()[:200]!r}")
         return out
 
-    def _record_test_run(self, instance_id, phase, t0, t1, c0, c1, test_ids) -> None:
+    def _record_test_run(
+        self, instance_id, phase, t0, t1, c0, c1, test_ids, command, exit_code, output,
+        image_id, image_ref,
+    ) -> None:
         """Append one test-run timing record (epoch ts + wall + container CPU-seconds)
         to <trajectory_dir>/<instance_id>_test_runs.jsonl, on the SAME clock as step3."""
         if not self.trajectory_dir:
@@ -505,7 +513,10 @@ class RegressionTester(BenchmarkEvaluation):
                "wall_s": round(t1 - t0, 3),
                "cpu_s": round(cpu_s, 3) if cpu_s is not None else None,
                "phase": phase, "instance_id": instance_id,
-               "n_tests": len(test_ids) if test_ids else None}
+               "n_tests": len(test_ids) if test_ids else None,
+               "command": command, "exit_code": exit_code,
+               "stdout_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+               "image_id": image_id, "image_ref": image_ref}
         try:
             os.makedirs(self.trajectory_dir, exist_ok=True)
             path = os.path.join(self.trajectory_dir, f"{instance_id}_test_runs.jsonl")
@@ -1059,7 +1070,11 @@ class RegressionTester(BenchmarkEvaluation):
             # command, so `{` is a literal arg, not a group). Newlines separate cleanly.
             out = self._run_tests(container, "\n".join(parts), None, instance_id, "retry",
                                   wrap=False, timeout=0)
-            passed = {l[len("RPASS::"):] for l in out.splitlines() if l.startswith("RPASS::")}
+            passed = {
+                line[len("RPASS::") :]
+                for line in out.splitlines()
+                if line.startswith("RPASS::")
+            }
             return {t: (t in passed) for t in tests}
         finally:
             container.remove(force=True)

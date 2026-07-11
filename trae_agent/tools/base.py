@@ -4,6 +4,7 @@
 """Base classes for tools and tool calling."""
 
 import asyncio
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -40,6 +41,11 @@ class ToolResult:
     result: str | None = None
     error: str | None = None
     id: str | None = None  # OpenAI-specific field
+    exit_code: int | None = None
+    executed_command: str | None = None
+    executor: str | None = None
+    started_at_ns: int | None = None
+    ended_at_ns: int | None = None
 
 
 ToolCallArguments = dict[str, str | int | float | dict[str, object] | list[object] | None]
@@ -216,6 +222,7 @@ class ToolExecutor:
 
         tool = self.tools[normalized_name]
 
+        started_at_ns = time.time_ns()
         try:
             tool_exec_result = await tool.execute(tool_call.arguments)
             return ToolResult(
@@ -225,6 +232,10 @@ class ToolExecutor:
                 error=tool_exec_result.error,
                 call_id=tool_call.call_id,
                 id=tool_call.id,
+                exit_code=tool_exec_result.error_code,
+                executor="local",
+                started_at_ns=started_at_ns,
+                ended_at_ns=time.time_ns(),
             )
         except Exception as e:
             return ToolResult(
@@ -233,6 +244,9 @@ class ToolExecutor:
                 error=f"Error executing tool '{tool_call.name}': {str(e)}",
                 call_id=tool_call.call_id,
                 id=tool_call.id,
+                executor="local",
+                started_at_ns=started_at_ns,
+                ended_at_ns=time.time_ns(),
             )
 
     async def parallel_tool_call(self, tool_calls: list[ToolCall]) -> list[ToolResult]:

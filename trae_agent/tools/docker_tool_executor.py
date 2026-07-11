@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from typing import Any
 
 from trae_agent.agent.docker_manager import DockerManager
@@ -79,6 +80,8 @@ class DockerToolExecutor:
         Builds and executes a command inside the Docker container,
         with path translation.
         """
+        started_at_ns = time.time_ns()
+        command_to_run: str | None = None
         try:
             # --- Parameter preprocessing and path translation ---
             processed_args: dict[str, Any] = {}
@@ -152,6 +155,11 @@ class DockerToolExecutor:
                 name=tool_call.name,
                 result=output,
                 success=exit_code == 0,
+                exit_code=exit_code,
+                executed_command=command_to_run,
+                executor="docker",
+                started_at_ns=started_at_ns,
+                ended_at_ns=time.time_ns(),
             )
         except Exception as e:
             return ToolResult(
@@ -160,4 +168,8 @@ class DockerToolExecutor:
                 result=f"Failed to build or execute command for tool '{tool_call.name}' in Docker: {e}",
                 success=False,
                 error=str(e),
+                executed_command=command_to_run,
+                executor="docker",
+                started_at_ns=started_at_ns,
+                ended_at_ns=time.time_ns(),
             )

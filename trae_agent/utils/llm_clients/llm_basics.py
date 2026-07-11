@@ -3,6 +3,7 @@
 
 
 from dataclasses import dataclass
+from typing import Any
 
 from trae_agent.tools.base import ToolCall, ToolResult
 
@@ -50,3 +51,8 @@ class LLMResponse:
     model: str | None = None
     finish_reason: str | None = None
     tool_calls: list[ToolCall] | None = None
+    replay_endpoint_api: str | None = None
+    replay_request_body: dict[str, Any] | None = None
+    replay_started_at_ns: int | None = None
+    replay_ended_at_ns: int | None = None
+    replay_attempt_count: int | None = None
