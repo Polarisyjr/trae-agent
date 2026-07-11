@@ -200,6 +200,7 @@ class SelectorAgent:
         ]
         self.llm_client = LLMClient(llm_config)
         self.trajectory_recorder: TrajectoryRecorder = TrajectoryRecorder(trajectory_file_name)
+        self.llm_client.set_trajectory_recorder(self.trajectory_recorder)
 
         self.initial_messages.append(
             LLMMessage(role="system", content=build_system_prompt(len(candidate_list)))
@@ -230,15 +231,6 @@ class SelectorAgent:
             turn += 1
             input_messages = messages
             llm_response = self.llm_client.chat(input_messages, self.llm_config, self.tools)
-            # Keep recording the raw interaction (LLM-response time) -> llm_interactions[],
-            # which count_turns.py reads for per-stage turn/token totals.
-            self.trajectory_recorder.record_llm_interaction(
-                input_messages,
-                llm_response,
-                self.llm_config.model_provider.provider,
-                self.llm_config.model,
-                self.tools,
-            )
             answer_content = llm_response.content
             print(f"\n### Selector's Answer({turn})\n", answer_content)
             messages: list[LLMMessage] = []
