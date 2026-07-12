@@ -4,8 +4,10 @@
 """OpenAI API client wrapper with tool integration."""
 
 import json
+import time
 from typing import override
 
+import httpx
 import openai
 from openai.types.responses import (
     EasyInputMessageParam,
@@ -30,8 +32,42 @@ class OpenAIClient(BaseLLMClient):
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
 
-        self.client: openai.OpenAI = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self._replay_http_attempts: list[dict] = []
+        self.client: openai.OpenAI = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            http_client=httpx.Client(
+                event_hooks={
+                    "request": [self._capture_replay_request],
+                    "response": [self._capture_replay_response],
+                }
+            ),
+        )
         self.message_history: ResponseInputParam = []
+
+    def _capture_replay_request(self, request: httpx.Request) -> None:
+        if not request.url.path.endswith("/responses"):
+            return
+        try:
+            body = json.loads(request.content)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = None
+        record = {
+            "body": body,
+            "started_at_ns": time.time_ns(),
+            "ended_at_ns": None,
+            "status_code": None,
+        }
+        request.extensions["trae_replay_attempt"] = record
+        self._replay_http_attempts.append(record)
+
+    def _capture_replay_response(self, response: httpx.Response) -> None:
+        record = response.request.extensions.get("trae_replay_attempt")
+        if record is None:
+            return
+        response.read()
+        record["ended_at_ns"] = time.time_ns()
+        record["status_code"] = response.status_code
 
     @override
     def set_chat_history(self, messages: list[LLMMessage]) -> None:
@@ -88,14 +124,20 @@ class OpenAIClient(BaseLLMClient):
             ]
 
         api_call_input: ResponseInputParam = self.message_history
-
         # Apply retry decorator to the API call
         retry_decorator = retry_with(
             func=self._create_openai_response,
             provider_name="OpenAI",
             max_retries=model_config.max_retries,
         )
+        self._replay_http_attempts = []
+        replay_started_at_ns = time.time_ns()
         response = retry_decorator(api_call_input, model_config, tool_schemas)
+        replay_ended_at_ns = time.time_ns()
+        wire_attempt = self._replay_http_attempts[-1] if self._replay_http_attempts else None
+        wire_body = wire_attempt.get("body") if wire_attempt else None
+        if not isinstance(wire_body, dict):
+            wire_body = None
 
         content = ""
         tool_calls: list[ToolCall] = []
@@ -149,6 +191,15 @@ class OpenAIClient(BaseLLMClient):
             model=response.model,
             finish_reason=response.status,
             tool_calls=tool_calls if len(tool_calls) > 0 else None,
+            replay_endpoint_api="responses",
+            replay_request_body=wire_body,
+            replay_started_at_ns=(
+                wire_attempt["started_at_ns"] if wire_attempt else replay_started_at_ns
+            ),
+            replay_ended_at_ns=(
+                wire_attempt["ended_at_ns"] if wire_attempt else replay_ended_at_ns
+            ),
+            replay_attempt_count=len(self._replay_http_attempts),
         )
 
         # Record trajectory if recorder is available

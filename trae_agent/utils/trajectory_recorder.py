@@ -125,6 +125,15 @@ class TrajectoryRecorder:
                 else None,
             },
             "tools_available": [tool.name for tool in tools] if tools else None,
+            "wire_request": {
+                "endpoint_api": response.replay_endpoint_api,
+                "body": response.replay_request_body,
+                "started_at_ns": response.replay_started_at_ns,
+                "ended_at_ns": response.replay_ended_at_ns,
+                "attempt_count": response.replay_attempt_count,
+            }
+            if response.replay_request_body is not None
+            else None,
         }
 
         self.trajectory_data["llm_interactions"].append(interaction)
@@ -261,6 +270,11 @@ class TrajectoryRecorder:
             "result": tool_result.result,
             "error": tool_result.error,
             "id": getattr(tool_result, "id", None),
+            "exit_code": tool_result.exit_code,
+            "executed_command": tool_result.executed_command,
+            "executor": tool_result.executor,
+            "started_at_ns": tool_result.started_at_ns,
+            "ended_at_ns": tool_result.ended_at_ns,
         }
 
     def get_trajectory_path(self) -> str:

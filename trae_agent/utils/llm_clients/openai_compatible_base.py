@@ -3,6 +3,7 @@
 
 """Base class for OpenAI-compatible clients with shared logic."""
 
+import copy
 import json
 import time
 from abc import ABC, abstractmethod
@@ -141,6 +142,24 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         # Get provider-specific extra headers
         extra_headers = self.provider_config.get_extra_headers()
+        wire_body = {
+            "model": model_config.model,
+            "messages": copy.deepcopy(self.message_history),
+            "top_p": model_config.top_p,
+            "n": 1,
+        }
+        if tool_schemas:
+            wire_body["tools"] = copy.deepcopy(tool_schemas)
+        if (
+            "o3" not in model_config.model
+            and "o4-mini" not in model_config.model
+            and "gpt-5" not in model_config.model
+        ):
+            wire_body["temperature"] = model_config.temperature
+        if model_config.should_use_max_completion_tokens():
+            wire_body["max_completion_tokens"] = model_config.get_max_tokens_param()
+        else:
+            wire_body["max_tokens"] = model_config.get_max_tokens_param()
 
         # Apply retry decorator to the API call
         retry_decorator = retry_with(
@@ -148,7 +167,9 @@ class OpenAICompatibleClient(BaseLLMClient):
             provider_name=self.provider_config.get_service_name(),
             max_retries=model_config.max_retries,
         )
+        replay_started_at_ns = time.time_ns()
         response = retry_decorator(model_config, tool_schemas, extra_headers)
+        replay_ended_at_ns = time.time_ns()
 
         choice = response.choices[0]
 
@@ -181,6 +202,10 @@ class OpenAICompatibleClient(BaseLLMClient):
                 if response.usage
                 else None
             ),
+            replay_endpoint_api="chat.completions",
+            replay_request_body=wire_body,
+            replay_started_at_ns=replay_started_at_ns,
+            replay_ended_at_ns=replay_ended_at_ns,
         )
 
         # Update message history

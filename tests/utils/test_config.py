@@ -88,9 +88,13 @@ class TestConfigBaseURL(unittest.TestCase):
 
         client = OpenAIClient(model_config)
 
-        mock_openai.assert_called_once_with(
-            api_key="test-api-key", base_url="https://custom-openai.example.com/v1"
-        )
+        mock_openai.assert_called_once()
+        kwargs = mock_openai.call_args.kwargs
+        self.assertEqual(kwargs["api_key"], "test-api-key")
+        self.assertEqual(kwargs["base_url"], "https://custom-openai.example.com/v1")
+        self.assertIn("request", kwargs["http_client"].event_hooks)
+        self.assertIn("response", kwargs["http_client"].event_hooks)
+        kwargs["http_client"].close()
         self.assertEqual(client.base_url, "https://custom-openai.example.com/v1")
 
     @patch("trae_agent.utils.llm_clients.anthropic_client.anthropic.Anthropic")
