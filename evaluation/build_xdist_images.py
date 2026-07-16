@@ -30,6 +30,7 @@ Usage (from the trae-agent repo root):
 """
 
 import argparse
+import os
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -79,7 +80,9 @@ def build_one(client, instance_id: str, rebuild: bool) -> tuple[str, str]:
     # the base for a normal `docker run` (else it inherits the tail keepalive).
     base_cfg = base_img.attrs.get("Config", {}) or {}
     container = client.containers.run(base, entrypoint=["tail", "-f", "/dev/null"],
-                                      detach=True)
+                                      detach=True,
+                                      labels=({"multiagent.trae_sweep": os.environ["TRAE_SWEEP_RUN_ID"]}
+                                              if os.environ.get("TRAE_SWEEP_RUN_ID") else None))
     try:
         rc, ver = _exec(container, "python -c 'import pytest; print(pytest.__version__)'")
         before = ver.strip().splitlines()[-1] if rc == 0 else ""

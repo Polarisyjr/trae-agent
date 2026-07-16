@@ -1,3 +1,4 @@
+import os
 import subprocess
 import time
 
@@ -31,6 +32,8 @@ class Sandbox:
             tty=True,
             stdin_open=True,
             privileged=True,
+            labels=({"multiagent.trae_sweep": os.environ["TRAE_SWEEP_RUN_ID"]}
+                    if os.environ.get("TRAE_SWEEP_RUN_ID") else None),
             volumes={host_path: {"bind": container_path, "mode": "rw"}},
         )
         print(f"Container {self.container.short_id} started with image {image}")

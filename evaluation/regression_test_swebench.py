@@ -381,6 +381,8 @@ class RegressionTester(BenchmarkEvaluation):
             self._pick_image(instance_id, repo),
             entrypoint=["tail", "-f", "/dev/null"],
             detach=True,
+            labels=({"multiagent.trae_sweep": os.environ["TRAE_SWEEP_RUN_ID"]}
+                    if os.environ.get("TRAE_SWEEP_RUN_ID") else None),
         )
 
     def _has_xdist(self, instance_id: str, repo: str) -> bool:

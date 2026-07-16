@@ -24,6 +24,7 @@ already have both are left untouched.
 """
 
 import argparse
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from docker import from_env
@@ -58,7 +59,9 @@ def backfill_one(client, xdist_tag: str) -> tuple[str, str]:
     # Keepalive entrypoint so we can exec into it; RESTORE the image's real entrypoint/cmd
     # on commit (else the tag would inherit the tail keepalive).
     container = client.containers.run(xdist_tag, entrypoint=["tail", "-f", "/dev/null"],
-                                      detach=True)
+                                      detach=True,
+                                      labels=({"multiagent.trae_sweep": os.environ["TRAE_SWEEP_RUN_ID"]}
+                                              if os.environ.get("TRAE_SWEEP_RUN_ID") else None))
     try:
         need_timeout = _exec(container, "python -c 'import pytest_timeout' 2>/dev/null")[0] != 0
         need_stream = _exec(container, "python -c 'import regr_stream' 2>/dev/null")[0] != 0
