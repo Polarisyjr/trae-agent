@@ -7,6 +7,11 @@ import pexpect
 from docker.errors import DockerException, ImageNotFound, NotFound
 
 
+def _sweep_labels():
+    sweep_id = os.environ.get("TRAE_SWEEP_RUN_ID")
+    return {"multiagent.trae_sweep": sweep_id} if sweep_id else None
+
+
 class DockerManager:
     """
     Manages Docker container lifecycle and command execution for the agent.
@@ -100,6 +105,7 @@ class DockerManager:
                         self.image,
                         command="sleep infinity",
                         detach=True,
+                        labels=_sweep_labels(),
                         volumes=volumes,
                         working_dir=self.container_workspace,
                     )
@@ -113,6 +119,7 @@ class DockerManager:
                         self.image,
                         command="sleep infinity",
                         detach=True,
+                        labels=_sweep_labels(),
                         working_dir=self.container_workspace,
                     )
                     self.container_id = self.container.id

@@ -4,6 +4,7 @@
 import argparse
 import io
 import json
+import os
 import shutil
 import subprocess
 import tarfile
@@ -174,6 +175,8 @@ class BenchmarkEvaluation:
                 repo_root_path.absolute().as_posix(): {"bind": "/trae-src", "mode": "ro"},
             },
             environment=self.docker_env_config.get("preparation_env", None),
+            labels=({"multiagent.trae_sweep": os.environ["TRAE_SWEEP_RUN_ID"]}
+                    if os.environ.get("TRAE_SWEEP_RUN_ID") else None),
         )
 
         build_commands = [
@@ -248,6 +251,8 @@ class BenchmarkEvaluation:
             working_dir="/trae-workspace",
             environment=self.docker_env_config.get("experiment_env", None),
             stream=True,
+            labels=({"multiagent.trae_sweep": os.environ["TRAE_SWEEP_RUN_ID"]}
+                    if os.environ.get("TRAE_SWEEP_RUN_ID") else None),
         )
 
         for fname in ["trae-agent.tar", "uv.tar", "uv_shared.tar", "trae_config.yaml"]:
