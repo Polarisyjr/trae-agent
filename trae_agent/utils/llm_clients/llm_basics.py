@@ -56,3 +56,7 @@ class LLMResponse:
     replay_started_at_ns: int | None = None
     replay_ended_at_ns: int | None = None
     replay_attempt_count: int | None = None
+    # Provider response/request identity.  vLLM exposes the same value on its
+    # OpenTelemetry request span, so Step3 can attribute overlapping requests to
+    # the correct task instead of joining by timestamp alone.
+    response_id: str | None = None

@@ -191,6 +191,7 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         llm_response = LLMResponse(
             content=choice.message.content or "",
+            response_id=response.id,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason,
             model=response.model,

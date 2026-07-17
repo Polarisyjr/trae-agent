@@ -187,6 +187,7 @@ class OpenAIClient(BaseLLMClient):
 
         llm_response = LLMResponse(
             content=content,
+            response_id=response.id,
             usage=usage,
             model=response.model,
             finish_reason=response.status,

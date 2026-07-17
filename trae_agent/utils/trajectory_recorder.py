@@ -100,6 +100,7 @@ class TrajectoryRecorder:
             "model": model,
             "input_messages": [self._serialize_message(msg) for msg in messages],
             "response": {
+                "response_id": response.response_id,
                 "content": response.content,
                 "model": response.model,
                 "finish_reason": response.finish_reason,
@@ -170,6 +171,7 @@ class TrajectoryRecorder:
             if llm_messages
             else None,
             "llm_response": {
+                "response_id": llm_response.response_id,
                 "content": llm_response.content,
                 "model": llm_response.model,
                 "finish_reason": llm_response.finish_reason,
