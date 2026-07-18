@@ -211,7 +211,19 @@ class BashTool(Tool):
 
     @override
     async def execute(self, arguments: ToolCallArguments) -> ToolExecResult:
-        if arguments.get("restart"):
+        restart = arguments.get("restart", False)
+        if isinstance(restart, str):
+            normalized_restart = restart.strip().lower()
+            if normalized_restart == "true":
+                restart = True
+            elif normalized_restart == "false":
+                restart = False
+            else:
+                return ToolExecResult(error="restart parameter must be a boolean.", error_code=-1)
+        elif not isinstance(restart, bool):
+            return ToolExecResult(error="restart parameter must be a boolean.", error_code=-1)
+
+        if restart:
             if self._session:
                 await self._session.stop()
             self._session = _BashSession()

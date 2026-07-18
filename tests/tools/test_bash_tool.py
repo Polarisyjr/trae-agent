@@ -50,6 +50,32 @@ class TestBashTool(unittest.IsolatedAsyncioTestCase):
         result = await self.tool.execute(ToolCallArguments({"command": "echo new session"}))
         self.assertIn("new session", result.output)
 
+    async def test_string_false_does_not_restart_session(self):
+        result = await self.tool.execute(
+            ToolCallArguments({"command": "echo command executed", "restart": "False"})
+        )
+
+        self.assertEqual(result.error_code, 0)
+        self.assertIn("command executed", result.output)
+        self.assertNotIn("restarted", result.output.lower())
+
+    async def test_string_true_restarts_session(self):
+        result = await self.tool.execute(
+            ToolCallArguments({"command": "echo should not run", "restart": "True"})
+        )
+
+        self.assertEqual(result.error_code, 0)
+        self.assertIn("restarted", result.output.lower())
+
+    async def test_invalid_restart_value_is_rejected(self):
+        result = await self.tool.execute(
+            ToolCallArguments({"command": "echo should not run", "restart": "yes"})
+        )
+
+        self.assertEqual(result.error_code, -1)
+        self.assertIn("must be a boolean", result.error)
+        self.assertIsNone(self.tool._session)
+
     async def test_successful_command_execution(self):
         result = await self.tool.execute(ToolCallArguments({"command": "echo hello world"}))
 
