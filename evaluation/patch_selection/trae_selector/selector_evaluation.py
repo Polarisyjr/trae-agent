@@ -26,8 +26,8 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
         return
     try:
         with open(path, "a") as f:
-            f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
-                                "wall_s": round(t1 - t0, 3), "stage": stage,
+            f.write(json.dumps({"ts_start": t0, "ts_end": t1,
+                                "wall_s": t1 - t0, "stage": stage,
                                 "instance_id": instance_id,
                                 "kind": kind}) + "\n")
     except OSError:

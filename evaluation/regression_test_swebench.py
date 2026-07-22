@@ -110,8 +110,8 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
         return
     try:
         with open(path, "a") as f:
-            f.write(json.dumps({"ts_start": round(t0, 3), "ts_end": round(t1, 3),
-                                "wall_s": round(t1 - t0, 3), "stage": stage,
+            f.write(json.dumps({"ts_start": t0, "ts_end": t1,
+                                "wall_s": t1 - t0, "stage": stage,
                                 "instance_id": instance_id,
                                 "kind": kind}) + "\n")
     except OSError:
@@ -511,9 +511,9 @@ class RegressionTester(BenchmarkEvaluation):
         if not self.trajectory_dir:
             return
         cpu_s = (c1 - c0) / 1e6 if (c0 is not None and c1 is not None) else None
-        rec = {"ts_start": round(t0, 3), "ts_end": round(t1, 3),
-               "wall_s": round(t1 - t0, 3),
-               "cpu_s": round(cpu_s, 3) if cpu_s is not None else None,
+        rec = {"ts_start": t0, "ts_end": t1,
+               "wall_s": t1 - t0,
+               "cpu_s": cpu_s,
                "phase": phase, "instance_id": instance_id,
                "n_tests": len(test_ids) if test_ids else None,
                "command": command, "exit_code": exit_code,
