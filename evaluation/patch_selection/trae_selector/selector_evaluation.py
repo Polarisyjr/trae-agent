@@ -34,6 +34,23 @@ def _record_container_setup(stage: str, instance_id: str, t0: float, t1: float,
         pass
 
 
+def _stop_container_with_record(sandbox: Sandbox, stage: str, instance_id: str) -> None:
+    """Stop a sandbox and record the teardown on both success and retry paths."""
+    import time as _time
+
+    t0 = _time.time()
+    try:
+        sandbox.stop_container()
+    finally:
+        _record_container_setup(
+            stage,
+            instance_id,
+            t0,
+            _time.time(),
+            kind="container_teardown",
+        )
+
+
 def run_instance(
     *,
     instance,
@@ -313,10 +330,11 @@ def run_instance_by_group(
                         is_success=is_success_patch,
                         group_id=group_id,
                     )
-                    _td0 = _time.time()
-                    sandbox.stop_container()
-                    _record_container_setup("select", instance["instance_id"], _td0,
-                                            _time.time(), kind="container_teardown")
+                    _stop_container_with_record(
+                        sandbox,
+                        "select",
+                        instance["instance_id"],
+                    )
                     break
                 except Exception as e:
                     print(f"Error occurred: {e}")
@@ -326,7 +344,11 @@ def run_instance_by_group(
                     sys.stdout.flush()
                     sys.stderr.flush()
                     if sandbox is not None:
-                        sandbox.stop_container()
+                        _stop_container_with_record(
+                            sandbox,
+                            "select",
+                            instance["instance_id"],
+                        )
         finally:
             sys.stdout = sys.__stdout__
             sys.stderr = sys.__stderr__
